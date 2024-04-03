@@ -50,8 +50,15 @@
 			<AdditionalIncludePath>C:\BuildTools\Windows Kits\10\Include\10.0.22621.0\um</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\BuildTools\Windows Kits\10\Include\10.0.22621.0\winrt</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\BuildTools\Windows Kits\10\Include\10.0.22621.0\cppwinrt</AdditionalIncludePath>
+			<AdditionalIncludePath>src</AdditionalIncludePath>
+			<AdditionalIncludePath>deps\math_lib\include</AdditionalIncludePath>
 		</AdditionalIncludePaths>
-		<Defines></Defines>
+		<Defines>
+			<Define>RH_PLATFORM_WINDOWS</Define>
+			<Define>WIN32</Define>
+			<Define>_WIN64</Define>
+			<Define>_MSC_VER</Define>
+		</Defines>
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
