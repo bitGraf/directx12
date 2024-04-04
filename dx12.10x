@@ -67,7 +67,9 @@
 			</ConfigAndPlatform>
 			<Config>
 				<Name>Debug</Name>
-				<Defines></Defines>
+				<Defines>
+					<Define>_DEBUG</Define>
+				</Defines>
 			</Config>
 			<Platform>
 				<Name>x64</Name>
