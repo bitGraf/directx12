@@ -1,9 +1,9 @@
 #include "build.h"
 
 int main(int argc, char** argv) {
-    for (int n = 1; n < argc; n++) {
-        printf("argv[%d] = '%s'\n", n, argv[n]);
-    }
+    // rebuild if needed!
+    auto_rebuild_self(argc, argv);
+
     printf("--------------------------------\n");
 
     project_config conf;
@@ -25,12 +25,13 @@ int main(int argc, char** argv) {
     targ.defines = { "RH_INTERNAL", "RH_PLATFORM_WINDOWS" };
     targ.link_dir = "bin";
     targ.link_libs = {"user32.lib", "Gdi32.lib", "Winmm.lib", "Shlwapi.lib"};
-    targ.include_dirs = relative_dirs("src", "deps/math_lib/include");
+    targ.include_dirs = relative_dirs("src", "deps/math_lib/include", "deps/DirectX-Headers/include");
     targ.src_files = find_all_files("src", ".cpp");
     targ.warnings_to_ignore = { 4100, 4189, 4505, 4201 /*4723*/ };
     targ.warning_level = 4;
     targ.warnings_are_errors = true;
     targ.subsystem = "windows";
+    targ.ignore_standard_include_paths = false;
     conf.targets.push_back(targ);
 
     LARGE_INTEGER freq, start, end;

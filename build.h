@@ -8,11 +8,14 @@
 #include <cstdarg>
 #include <unordered_map>
 #include <fstream>
+#include <cassert>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <strsafe.h>
 #include <shlobj_core.h>
 #include <msi.h>
+#include <shellapi.h>
 
 #pragma comment( lib, "Shell32" )
 #pragma comment( lib, "Msi" )
@@ -63,11 +66,13 @@ struct target_config {
     std::vector<std::string> link_libs;
     std::string link_dir = "";
     std::string subsystem = "console";
+    bool ignore_standard_include_paths = false;
 };
 
 std::string generate_target_build_cmd(const project_config& conf, const target_config& targ) {
     // start building options into flag strings 
-    std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC ";
+    //std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC ";
+    std::string default_flags = "/nologo /Gm- /GR- /EHsc /FC ";
 
     std::string std_cmd = "/std:c++" + std::to_string(conf.cpp_standard) + " ";
 
@@ -89,6 +94,7 @@ std::string generate_target_build_cmd(const project_config& conf, const target_c
     if (conf.generate_debug_info) compile_flags += "/Z7 ";
     if (targ.type == shared_lib) compile_flags += "/LD ";
 
+    if (targ.ignore_standard_include_paths) compile_flags += "/X ";
 
 
     std::string link_flags = "/link ";
@@ -100,7 +106,7 @@ std::string generate_target_build_cmd(const project_config& conf, const target_c
     else                         link_flags += "/OPT:NOREF ";
 
     std::string subsystem = targ.subsystem;
-    for (auto & c: subsystem) c = toupper(c);
+    for (char & c: subsystem) c = toupper(c);
     link_flags += "/SUBSYSTEM:" + subsystem + " ";
 
     if (targ.link_dir.size()) link_flags += "/LIBPATH:\"" + targ.link_dir + "\" ";
@@ -192,7 +198,8 @@ std::string generate_preprocess_cmd(const project_config& conf, const target_con
 
 std::string generate_compile_cmd(const project_config& conf, const target_config& targ, const std::string& src_file) {
     // start building options into flag strings 
-    std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC /c ";
+    //std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC /c ";
+    std::string default_flags = "/nologo /Gm- /GR- /EHsc /FC /c ";
 
     std::string std_cmd = "/std:c++" + std::to_string(conf.cpp_standard) + " ";
 
@@ -256,7 +263,8 @@ std::string generate_compile_cmd(const project_config& conf, const target_config
 
 std::string generate_link_cmd(const project_config& conf, const target_config& targ) {
     // start building options into flag strings 
-    std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC ";
+    //std::string default_flags = "/nologo /Gm- /GR- /EHa- /FC ";
+    std::string default_flags = "/nologo /Gm- /GR- /EHsc /FC ";
 
     std::string std_cmd = "/std:c++" + std::to_string(conf.cpp_standard) + " ";
 
@@ -765,6 +773,149 @@ std::vector<std::string> __get_relative_dirs(const char* calling_file, std::vect
     }
 
     return full_dirs;
+}
+
+typedef uint64_t uint64;
+uint64 get_file_timestamp(const char* filename) {
+    uint64 res = 0;
+
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    BOOL found = GetFileAttributesExA(filename, GetFileExInfoStandard, &info);
+    if (!found) {
+        return uint64(-1);
+    }
+
+    uint64 L = (uint64)info.ftLastWriteTime.dwLowDateTime;
+    uint64 H = (uint64)info.ftLastWriteTime.dwHighDateTime;
+    res = (H<<32) | L;
+
+    return res;
+}
+
+
+#include <algorithm>
+#define auto_rebuild_self(argc, argv) _auto_rebuild_self(argc, argv, __FILE__)
+void _auto_rebuild_self(int argc, char* argv[], const char* src_filename) {
+    if (argc == 2) {
+        if (strcmp(argv[1], "rebuild") == 0) {
+            // we are now _build.exe, so we can copy ourselves to build.exe
+            // and rename the incoming one to our old name.
+
+            if (!MoveFileEx("_build.exe", "build.exe", MOVEFILE_REPLACE_EXISTING)) {
+                printf("failed to rename new exe to self\n");
+                return;
+            }
+
+            return;
+        }
+    }
+
+    project_config conf;
+    conf.project_name = "auto-rebuild";
+    conf.cpp_standard = 14;
+    conf.bin_dir = ".\\";
+    conf.obj_dir = ".\\bin\\int";
+    conf.debug_build = false;
+    conf.static_link_std = true;
+    conf.opt_level = 0;
+    conf.opt_intrinsics = false;
+    conf.generate_debug_info = false;
+    conf.incremental_link = false;
+    conf.remove_unref_funcs = false;
+
+    target_config targ;
+    targ.target_name = "_build";
+    targ.type = executable;
+    targ.defines = { };
+    targ.link_dir;
+    targ.link_libs;
+    targ.include_dirs;
+    targ.src_files = { src_filename };
+    targ.warnings_to_ignore = { /*4100, 4189, 4505, 4201*/ /*4723*/ };
+    targ.warning_level = 1;
+    targ.warnings_are_errors = false;
+    targ.subsystem = "console";
+    conf.targets.push_back(targ);
+
+    ensure_output_dirs(conf);
+    bool verbose = false;
+
+    // check if need to rebuild!
+    // not going to do the whole preprocess-hash to check if dependencies change,
+    // just going to look at the last-modified time of build.cpp (and maybe build.h ?)
+    // and compare to last-modified time of build.exe
+    uint64 build_cpp_stamp = get_file_timestamp(targ.src_files[0].c_str());
+    uint64 build_hpp_stamp = get_file_timestamp("build.h");
+    uint64 src_stamp = max(build_cpp_stamp, build_hpp_stamp);
+    uint64 build_exe_stamp = get_file_timestamp("build.exe");
+
+    bool need_rebuild = (src_stamp >= build_exe_stamp);
+
+    if (need_rebuild) {
+        printf("--------------------------------\n");
+        printf("Rebuilding self [%s]...", targ.target_name.c_str());
+        if (verbose) {
+            printf("\n");
+            printf("  Generating build_cmd...");
+        }
+        std::string cmd = generate_target_build_cmd(conf, targ);
+        if (verbose) {
+            printf("Done.\n");
+
+            printf("    Building [%s]...", targ.target_name.c_str());
+            //int res = system(cmd.c_str());
+        }
+
+        std::string std_out, std_err;
+        int res = run_command(cmd, std_out, std_err);
+
+        if (res) {
+            printf("Failed! ErrorCode: %d\n", res);
+            printf("%s\n", std_out.c_str());
+            printf("%s\n", std_err.c_str());
+            return;
+        }
+
+        printf("Done.\n");
+
+        // create a new process
+        STARTUPINFO siStartInfo;
+        memset(&siStartInfo, 0, sizeof(siStartInfo));
+
+        siStartInfo.cb = sizeof(STARTUPINFO);
+        // info.hStdInput  = duplicate_handle_as_inheritable(GetStdHandle(STD_INPUT_HANDLE));
+        // info.hStdOutput = duplicate_handle_as_inheritable(GetStdHandle(STD_OUTPUT_HANDLE));
+        // info.hStdError  = duplicate_handle_as_inheritable(GetStdHandle(STD_ERROR_HANDLE));
+        // info.dwFlags |= STARTF_USESTDHANDLES;
+
+        PROCESS_INFORMATION procinfo;
+        memset(&procinfo, 0, sizeof(procinfo));
+
+        auto result = CreateProcessA(
+            "_build.exe",          // LPCSTR                   lpApplicationName
+            "_build.exe rebuild",  // LPSTR                    lpCommandLine
+            nullptr,               // LPSECURITY_ATTRIBUTES    lpProcessAttributes
+            nullptr,               // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+            true,                  // BOOL                     bInheritHandles
+            0,                     // DWORD                    dwCreationFlags
+            nullptr,               // LPVOID                   lpEnvironment
+            nullptr,               // LPCSTR                   lpCurrentDirectory
+            &siStartInfo,          // LPSTARTUPINFO            lpStartupInfo
+            &procinfo              // LPPROCESS_INFORMATION    lpProcessInformation
+        );
+
+        if (!result) {
+            printf("Failed to start new process!\n");
+            return;
+        }
+
+        CloseHandle(procinfo.hThread);
+
+        // exit without waiting for child to finish!
+        // ideally, by the timt the child process needs to access 
+        // the file build.exe, this process will be done.
+        ExitProcess(0);
+    }
 }
 
 #endif

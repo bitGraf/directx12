@@ -1,3 +1,6 @@
 [submodule "deps/math_lib"]
 	path = deps/math_lib
 	url = https://github.com/bitGraf/math_lib.git
+[submodule "deps/DirectX-Headers"]
+	path = deps/DirectX-Headers
+	url = https://github.com/microsoft/DirectX-Headers.git

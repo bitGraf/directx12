@@ -5,7 +5,7 @@ rem set vc_build_tools_path="C:\BuildTools"
 rem call %vc_build_tools_path%\devcmd.bat
 
 if "%0" == "shell" (
-    start "" "C:\Program Files\PureDevSoftware\10x\10x.exe" build.10x
+    start "" "C:\Program Files\PureDevSoftware\10x\10x.exe" dx12.10x
 )
 
 if NOT "%0" == "shell" (
