@@ -74,7 +74,9 @@ RHAPI void  platform_unload_shared_library(void* shared_lib);
 RHAPI void  platform_filetime_to_systime(uint64 file_time, char* buffer, uint64 buf_size);
 
 // this is bad and dumb :)
-#if RH_PLATFORM_LINUX
+#if RH_PLATFORM_WINDOWS
+void* platform_get_window_handle();
+#elif RH_PLATFORM_LINUX
 void* platform_get_raw_handle();
 uint32 platform_get_window_id();
 #endif

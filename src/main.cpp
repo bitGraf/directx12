@@ -72,13 +72,17 @@ int WinMain() {
     uint32 target_framerate = 60;
 
     // renderer startup
+    if (!init_renderer()) {
+        RH_FATAL("Failed to initialize Renderer!\n");
+        return -1;
+    }
     ////////////////////////////////////////////////////////////////////////////////////////
 
     // init resources
     ////////////////////////////////////////////////////////////////////////////////////////
 
     // after resource system is setup
-    ////////////////////////////////////////////////////////////////////////////////////////
+    create_pipeline();
 
     engine.target_frame_time = 1.0f / ((real32)target_framerate);
     engine.last_frame_time = engine.target_frame_time;
@@ -126,6 +130,7 @@ int WinMain() {
                 // app update
 
                 // render scene
+                renderer_draw_frame();
 
                 uint64 WorkCounter = platform_get_wall_clock();
                 real32 WorkSecondsElapsed = (real32)platform_get_seconds_elapsed(LastCounter, WorkCounter);
@@ -156,7 +161,8 @@ int WinMain() {
                 LastCounter = EndCounter;
     
                 //Win32DisplayBufferToWindow(DeviceContext, Dimension.Width, Dimension.Height);
-                platform_swap_buffers();
+                //platform_swap_buffers();
+                renderer_present();
     
                 FlipWallClock = platform_get_wall_clock();
 
@@ -185,6 +191,7 @@ int WinMain() {
     }
 
     // renderer shutdown
+    kill_renderer();
     platform_shutdown();
 
     // shutdown all systems

@@ -173,6 +173,61 @@ bool32 platform_setup_paths() {
     return true;
 }
 
+// https://stackoverflow.com/a/41480827
+LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo)
+{
+    PEXCEPTION_RECORD ExceptionRecord = ExceptionInfo->ExceptionRecord;
+
+    switch (ExceptionRecord->ExceptionCode)
+    {
+        case DBG_PRINTEXCEPTION_WIDE_C:
+        case DBG_PRINTEXCEPTION_C:
+
+            if (ExceptionRecord->NumberParameters >= 2)
+            {
+                ULONG len = (ULONG)ExceptionRecord->ExceptionInformation[0];
+
+                union {
+                    ULONG_PTR up;
+                    PCWSTR pwz;
+                    PCSTR psz;
+                };
+
+                up = ExceptionRecord->ExceptionInformation[1];
+
+                HANDLE hOut = GetStdHandle(STD_ERROR_HANDLE);
+
+                if (ExceptionRecord->ExceptionCode == DBG_PRINTEXCEPTION_C)
+                {
+                    // localized text will be incorrect displayed, if used not CP_OEMCP encoding 
+                    // WriteConsoleA(hOut, psz, len, &len, 0);
+
+                    // assume CP_ACP encoding
+                    ULONG n = MultiByteToWideChar(CP_ACP, 0, psz, len, 0, 0);
+                    if (n)
+                    {
+                        PWSTR wz = (PWSTR)alloca(n * sizeof(WCHAR));
+
+                        len = MultiByteToWideChar(CP_ACP, 0, psz, len, wz, n);
+                        if (len)
+                        {
+                            pwz = wz;
+                        }
+                    }
+                }
+
+                if (len)
+                {
+                    WriteConsoleW(hOut, pwz, len - 1, &len, 0);
+                }
+
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void platform_init_logging(bool32 create_console) {
     AttachConsole((DWORD)-1);
 
@@ -196,6 +251,8 @@ void platform_init_logging(bool32 create_console) {
     //       the console does not move. This is how i want it!
     HWND console_window = GetConsoleWindow();
     SetWindowPos(console_window, HWND_TOP, 900, 17, 1003, 1000, 0);
+
+    //AddVectoredExceptionHandler(TRUE, VexHandler);
     #endif
 }
 bool32 platform_startup(AppConfig* config) {
@@ -220,7 +277,7 @@ bool32 platform_startup(AppConfig* config) {
     // create window class
     WNDCLASSA WindowClass = {};
 
-    WindowClass.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    WindowClass.style = /*CS_OWNDC |*/ CS_HREDRAW | CS_VREDRAW;
     WindowClass.lpfnWndProc = win32_window_callback;
     WindowClass.hInstance = global_win32_state.instance;
     WindowClass.hCursor = LoadCursorA(NULL, IDC_CROSS);
@@ -599,7 +656,7 @@ int win32_get_monitor_refresh_rate() {
 }
 
 void platform_swap_buffers() {
-    SwapBuffers(global_win32_state.device_context);
+    //SwapBuffers(global_win32_state.device_context);
 }
 
 
@@ -798,6 +855,10 @@ void platform_update_mouse() {
 
         SetCursorPos(center_x,center_y);
     }
+}
+
+void* platform_get_window_handle() {
+    return global_win32_state.window;
 }
 
 #endif //#if RH_PLATFORM_WINDOWS
