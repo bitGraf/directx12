@@ -6,6 +6,7 @@
 // DirectX 12 headers.
 #include <directx/d3d12.h>
 #include <directx/d3dx12.h>
+#include <directxmath.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
 
@@ -50,6 +51,10 @@ struct DX12State {
     Microsoft::WRL::ComPtr<ID3D12Resource> DepthStencilBuffer;
 
     DWORD callback_cookie;
+
+    // mesh and data
+    Microsoft::WRL::ComPtr<ID3D12Resource> vertex_buffer;
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view;
 };
 global_variable DX12State dx12;
 
@@ -65,6 +70,34 @@ void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category,
                             D3D12_MESSAGE_ID ID, 
                             LPCSTR pDescription, 
                             void* pContext);
+
+void FlushCommandQueue()
+{
+	// Advance the fence value to mark commands up to this fence point.
+    dx12.FenceValue++;
+
+    // Add an instruction to the command queue to set a new fence point.  Because we 
+    // are on the GPU timeline, the new fence point won't be set until the GPU finishes
+    // processing all the commands prior to this Signal().
+    if FAILED(dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.FenceValue)) {
+        RH_FATAL("Failed to signal");
+    }
+
+	// Wait until the GPU has completed commands up to this fence point.
+    if(dx12.Fence->GetCompletedValue() < dx12.FenceValue)
+	{
+		HANDLE eventHandle = CreateEventEx(nullptr, false, false, EVENT_ALL_ACCESS);
+
+        // Fire event when GPU hits current fence.  
+        if FAILED(dx12.Fence->SetEventOnCompletion(dx12.FenceValue, eventHandle)) {
+            RH_FATAL("Failed to set event");
+        }
+
+        // Wait until the GPU hits current fence event is fired.
+		WaitForSingleObject(eventHandle, INFINITE);
+        CloseHandle(eventHandle);
+	}
+}
 
 bool init_renderer() {
     using namespace Microsoft::WRL;
@@ -406,6 +439,86 @@ bool init_renderer() {
     dx12.FenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
     AssertMsg(dx12.FenceEvent, "Failed to create fence event.");
 
+    // load mesh data
+    auto alloc = dx12.CommandAllocators[dx12.CurrentBackBufferIndex];
+    auto cmdlist = dx12.CommandList;
+
+    alloc->Reset();
+    cmdlist->Reset(alloc.Get(), nullptr);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    {
+        struct Vertex
+        {
+            DirectX::XMFLOAT3 position;
+            DirectX::XMFLOAT4 color;
+        };
+
+        // Define the geometry for a triangle.
+        Vertex vertex_data[] =
+        {
+            { {  0.0f,   0.25f, 0.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
+            { {  0.25f, -0.25f, 0.0f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+            { { -0.25f, -0.25f, 0.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } }
+        };
+
+        const UINT buf_size = sizeof(vertex_data);
+
+        D3D12_INPUT_ELEMENT_DESC vert_desc[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        };
+
+        // you can only directly copy data from CPU to GPU into the upload heap.
+        // ideally we want this to be in the default buffer, so to do that:
+        // 1. create the actual buffer in the default heap
+        auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(buf_size);
+        dx12.Device->CreateCommittedResource(
+            &prop, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, IID_PPV_ARGS(&dx12.vertex_buffer));
+
+        // 2. create a temp upload buffer in the upload heap
+        prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        desc = CD3DX12_RESOURCE_DESC::Buffer(buf_size);
+        dx12.Device->CreateCommittedResource(
+            &prop, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_GENERIC_READ, 
+            nullptr, IID_PPV_ARGS(&upload_buffer));
+
+        // 3. describe the data we wish to copy to the gpu
+        D3D12_SUBRESOURCE_DATA subResourceData = {};
+        subResourceData.pData      = vertex_data;
+        subResourceData.RowPitch   = buf_size;
+        subResourceData.SlicePitch = subResourceData.RowPitch;
+
+        // 4. schedule the copy into the default resource
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.vertex_buffer.Get(), 
+                                                                              D3D12_RESOURCE_STATE_COMMON, 
+                                                                              D3D12_RESOURCE_STATE_COPY_DEST);
+        cmdlist->ResourceBarrier(1, &barrier);
+        UpdateSubresources<1>(cmdlist.Get(), dx12.vertex_buffer.Get(), upload_buffer.Get(), 0, 0, 1, &subResourceData);
+        barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.vertex_buffer.Get(),
+                                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       D3D12_RESOURCE_STATE_GENERIC_READ);
+        cmdlist->ResourceBarrier(1, &barrier);
+
+        // initialize the vertex buffer view.
+        dx12.vertex_buffer_view.BufferLocation = dx12.vertex_buffer->GetGPUVirtualAddress();
+        dx12.vertex_buffer_view.StrideInBytes  = sizeof(Vertex);
+        dx12.vertex_buffer_view.SizeInBytes    = buf_size;
+    }
+
+    // Execute the initialization commands.
+    if FAILED(cmdlist->Close()) {
+        RH_FATAL("Failed to close command list");
+    }
+    ID3D12CommandList* cmdsLists[] = { cmdlist.Get() };
+    dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+    // Wait until initialization is complete.
+    FlushCommandQueue();
+
 
 #if 0
     // List supported display modes
@@ -576,6 +689,11 @@ bool renderer_draw_frame() {
                                               dx12.CurrentBackBufferIndex, dx12.RTVDescriptorSize);
 
             dx12.CommandList->ClearRenderTargetView(rtv, color, 0, nullptr);
+
+            // bind and draw the vertex buffer
+            //dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.vertex_buffer_view);
+            //dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            //dx12.CommandList->DrawInstanced(3, 1, 0, 0);
         }
 
         return renderer_end_Frame();

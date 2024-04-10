@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     targ.type = executable;
     targ.defines = { "_DEBUG", "RH_INTERNAL", "RH_PLATFORM_WINDOWS" };
     targ.link_dir = "bin";
-    targ.link_libs = {"user32.lib", "Gdi32.lib", "Winmm.lib", "Shlwapi.lib", "Shell32.lib", "D3D12.lib", "DXGI.lib"};
+    targ.link_libs = {"user32.lib", "Gdi32.lib", "Winmm.lib", "Shlwapi.lib", "Shell32.lib", "D3D12.lib", "DXGI.lib", "dxguid.lib"};
     targ.include_dirs = relative_dirs("src", "deps/math_lib/include", "deps/DirectX-Headers/include");
     targ.src_files = find_all_files("src", ".cpp");
     //targ.include_dirs = relative_dirs("3dgep_example", "deps/math_lib/include", "deps/DirectX-Headers/include");
