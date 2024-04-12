@@ -6,6 +6,7 @@
 // DirectX 12 headers.
 #include <directx/d3d12.h>
 #include <directx/d3dx12.h>
+#include <d3dcompiler.h>
 #include <directxmath.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
@@ -24,6 +25,36 @@
 
 #include "Core/Logger.h"
 
+const char vert_shader_src[] = 
+"cbuffer cbPerObject : register(b0)\n"
+"{\n"
+"  float4x4 gWorldViewProj;\n"
+"};\n"
+"void VS(    float3 iPosL  : POSITION,\n"
+"            float4 iColor : COLOR,\n"
+"        out float4 oPosH  : SV_POSITION,\n"
+"        out float4 oColor : COLOR) {\n"
+"  // Transform to homogeneous clip space\n"
+"  oPosH = mul(float4(iPosL, 1.0f), gWorldViewProj);\n"
+"  oPosH.z = 0.5;\n"
+"\n"
+"  // Just pass vertex color into the pixel shader\n"
+"  oColor = iColor;\n"
+"}\n";
+
+const char pixel_shader_src[] = 
+"float4 PS (float4 posH  : SV_POSITION,\n"
+"           float4 color : COLOR) : SV_TARGET {\n"
+"  return color;\n"
+"}\n";
+
+struct cbLayout {
+    DirectX::XMFLOAT4X4 WorldViewProj = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
+                                                            0.0f, 1.0f, 0.0f, 0.0f,
+                                                            0.0f, 0.0f, 1.0f, 0.0f,
+                                                            0.0f, 0.0f, 0.0f, 1.0f);
+};
+
 struct DX12State {
     // DirectX 12 Objects
     static const uint8                                  NumFramesInFlight = 3;
@@ -38,7 +69,9 @@ struct DX12State {
 
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        RTVDescriptorHeap;
     uint32                                              RTVDescriptorSize;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        DSVDescriptorHeap;
     uint32                                              DSVDescriptorSize;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        CBVDescriptorHeap;
     uint32                                              CBVDescriptorSize;
 
     uint32                                              CurrentBackBufferIndex;
@@ -55,6 +88,13 @@ struct DX12State {
     // mesh and data
     Microsoft::WRL::ComPtr<ID3D12Resource> vertex_buffer;
     D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view;
+
+    // constant buffer
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
+
+    // Pipeline State Object
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
 };
 global_variable DX12State dx12;
 
@@ -347,9 +387,33 @@ bool init_renderer() {
     { // RTV
         D3D12_DESCRIPTOR_HEAP_DESC desc = {};
         desc.NumDescriptors = dx12.NumFramesInFlight;
-        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 
         if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.RTVDescriptorHeap))) {
+            RH_FATAL("Failed making descriptor heap");
+            return false;
+        }
+    }
+    { // CBV
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+        desc.NumDescriptors = 1;
+        desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        desc.NodeMask       = 0;
+
+        if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.CBVDescriptorHeap))) {
+            RH_FATAL("Failed making descriptor heap");
+            return false;
+        }
+    }
+    { // DSV
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+        desc.NumDescriptors = 1;
+        desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        desc.NodeMask       = 0;
+
+        if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.DSVDescriptorHeap))) {
             RH_FATAL("Failed making descriptor heap");
             return false;
         }
@@ -428,6 +492,16 @@ bool init_renderer() {
             RH_FATAL("Failed to create depth/stencil buffer");
             return false;
         }
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc;
+        dsvDesc.Flags              = D3D12_DSV_FLAG_NONE;
+        dsvDesc.ViewDimension      = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsvDesc.Format             = depth_fmt;
+        dsvDesc.Texture2D.MipSlice = 0;
+
+        CD3DX12_CPU_DESCRIPTOR_HANDLE dsv(dx12.DSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+        dx12.Device->CreateDepthStencilView(dx12.DepthStencilBuffer.Get(), &dsvDesc, dsv);
     }
 
     // create fence
@@ -439,6 +513,51 @@ bool init_renderer() {
     dx12.FenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
     AssertMsg(dx12.FenceEvent, "Failed to create fence event.");
 
+    // create constant buffer
+    {
+        uint32 cbSize = sizeof(cbLayout);
+        cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
+
+        auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize * 1);
+        dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
+                                             &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer));
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
+        cbv_desc.BufferLocation = dx12.upload_cbuffer->GetGPUVirtualAddress();
+        cbv_desc.SizeInBytes = cbSize;
+        dx12.Device->CreateConstantBufferView(&cbv_desc, 
+                                              dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    // create root signature
+    {
+        CD3DX12_ROOT_PARAMETER slot_root_parameter[1];
+
+        CD3DX12_DESCRIPTOR_RANGE cbv_table;
+        cbv_table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
+
+        slot_root_parameter[0].InitAsDescriptorTable(1, &cbv_table);
+
+        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(1, slot_root_parameter, 0, nullptr,
+                                                  D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+        ComPtr<ID3DBlob> serialized_root_sig = nullptr;
+        ComPtr<ID3DBlob> error_blob          = nullptr;
+        HRESULT hr = D3D12SerializeRootSignature(&root_sig_desc,
+                                                 D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                 serialized_root_sig.GetAddressOf(),
+                                                 error_blob.GetAddressOf());
+        if FAILED(dx12.Device->CreateRootSignature(0,
+                                                   serialized_root_sig->GetBufferPointer(),
+                                                   serialized_root_sig->GetBufferSize(),
+                                                   IID_PPV_ARGS(&dx12.root_signature))) {
+            RH_FATAL("Could not create root signature");
+            return false;
+        }
+    }
+
     // load mesh data
     auto alloc = dx12.CommandAllocators[dx12.CurrentBackBufferIndex];
     auto cmdlist = dx12.CommandList;
@@ -446,6 +565,10 @@ bool init_renderer() {
     alloc->Reset();
     cmdlist->Reset(alloc.Get(), nullptr);
     Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    D3D12_INPUT_ELEMENT_DESC vert_desc[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+    };
     {
         struct Vertex
         {
@@ -462,11 +585,6 @@ bool init_renderer() {
         };
 
         const UINT buf_size = sizeof(vertex_data);
-
-        D3D12_INPUT_ELEMENT_DESC vert_desc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-            { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
-        };
 
         // you can only directly copy data from CPU to GPU into the upload heap.
         // ideally we want this to be in the default buffer, so to do that:
@@ -507,6 +625,12 @@ bool init_renderer() {
         dx12.vertex_buffer_view.BufferLocation = dx12.vertex_buffer->GetGPUVirtualAddress();
         dx12.vertex_buffer_view.StrideInBytes  = sizeof(Vertex);
         dx12.vertex_buffer_view.SizeInBytes    = buf_size;
+
+        // Transition the resource from its initial state to be used as a depth buffer.
+        auto t = CD3DX12_RESOURCE_BARRIER::Transition(dx12.DepthStencilBuffer.Get(),
+                                                      D3D12_RESOURCE_STATE_COMMON, 
+                                                      D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        cmdlist->ResourceBarrier(1, &t);
     }
 
     // Execute the initialization commands.
@@ -516,9 +640,90 @@ bool init_renderer() {
     ID3D12CommandList* cmdsLists[] = { cmdlist.Get() };
     dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
 
+    // compile shaders
+    ComPtr<ID3DBlob> vs_bytecode;
+    {
+        ComPtr<ID3DBlob> vs_errors;
+        if FAILED(D3DCompile(vert_shader_src,
+                             sizeof(vert_shader_src),
+                             NULL,
+                             NULL,
+                             NULL,
+                             "VS",
+                             "vs_5_0",
+                             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                             0,
+                             &vs_bytecode,
+                             &vs_errors)) {
+            RH_FATAL("Failed to compile vertex shader");
+            RH_FATAL("Errors: %s", (char*)vs_errors->GetBufferPointer());
+            return false;
+        }
+    }
+    ComPtr<ID3DBlob> ps_bytecode;
+    {
+        ComPtr<ID3DBlob> ps_errors;
+        if FAILED(D3DCompile(pixel_shader_src,
+                             sizeof(pixel_shader_src),
+                             NULL,
+                             NULL,
+                             NULL,
+                             "PS",
+                             "ps_5_0",
+                             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                             0,
+                             &ps_bytecode,
+                             &ps_errors)) {
+            RH_FATAL("Failed to compile pixel shader");
+            RH_FATAL("Errors: %s", (char*)ps_errors->GetBufferPointer());
+            return false;
+        }
+    }
+
+    // Pipeline state object (PSO)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = dx12.root_signature.Get();
+
+        desc.VS.pShaderBytecode = vs_bytecode->GetBufferPointer();
+        desc.VS.BytecodeLength  = vs_bytecode->GetBufferSize();
+
+        desc.PS.pShaderBytecode = ps_bytecode->GetBufferPointer();
+        desc.PS.BytecodeLength  = ps_bytecode->GetBufferSize();
+
+        desc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+
+        desc.SampleMask = UINT_MAX;
+
+        desc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+
+        desc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+
+        desc.InputLayout.pInputElementDescs = vert_desc;
+        desc.InputLayout.NumElements = 2;
+
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+        desc.NumRenderTargets = 1;
+        
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+
+        // create the pso
+        if FAILED(dx12.Device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&dx12.pso))) {
+            RH_FATAL("Failed to create PSO");
+            return false;
+        }
+    }
+
     // Wait until initialization is complete.
     FlushCommandQueue();
-
+    // now that the commands have been executed, upload_buffer can be released 
+    // (this happens at end of scope automatically)
 
 #if 0
     // List supported display modes
@@ -674,27 +879,71 @@ bool renderer_draw_frame() {
         auto backbuffer = dx12.BackBuffers[dx12.CurrentBackBufferIndex];
 
         allocator->Reset();
-        dx12.CommandList->Reset(allocator.Get(), nullptr);
+        dx12.CommandList->Reset(allocator.Get(), dx12.pso.Get());
+
+        // set viewport
+        D3D12_VIEWPORT viewport;
+        viewport.TopLeftX = 0;
+        viewport.TopLeftY = 0;
+        viewport.Width    = static_cast<float>(800);
+        viewport.Height   = static_cast<float>(600);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        dx12.CommandList->RSSetViewports(1, &viewport);
+
+        D3D12_RECT scissor = { 0, 0, 800, 600 };
+        dx12.CommandList->RSSetScissorRects(1, &scissor);
+
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(dx12.RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+                                          dx12.CurrentBackBufferIndex, dx12.RTVDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE dsv(dx12.DSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
         // clear render target
         {
+            // transition the backbuffer into render target
             CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
                 backbuffer.Get(),
                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
             dx12.CommandList->ResourceBarrier(1, &barrier);
 
+            // clear the color buffer
             FLOAT color[] = { 0.4f, 0.6f, 0.9f, 1.0f }; // cornflower blue
-            CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(dx12.RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
-                                              dx12.CurrentBackBufferIndex, dx12.RTVDescriptorSize);
-
             dx12.CommandList->ClearRenderTargetView(rtv, color, 0, nullptr);
 
-            // bind and draw the vertex buffer
-            //dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.vertex_buffer_view);
-            //dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            //dx12.CommandList->DrawInstanced(3, 1, 0, 0);
+            // clear the depth/stencil buffer
+            dx12.CommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+
+            // specify render target to use
+            dx12.CommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
         }
+
+        // upload the constant buffer
+        {
+            cbLayout cbdata;
+            size_t cbsize = sizeof(cbdata);
+
+            BYTE* mapped_data = nullptr;
+            dx12.upload_cbuffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
+            memcpy(mapped_data, &cbdata, cbsize);
+            dx12.upload_cbuffer->Unmap(0, nullptr);
+        }
+
+        dx12.CommandList->SetGraphicsRootSignature(dx12.root_signature.Get());
+        ID3D12DescriptorHeap* descriptorHeaps[] = {
+            dx12.CBVDescriptorHeap.Get()
+        };
+        dx12.CommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+
+        CD3DX12_GPU_DESCRIPTOR_HANDLE cbv(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+        cbv.Offset(0, dx12.CBVDescriptorSize);
+
+        dx12.CommandList->SetGraphicsRootDescriptorTable(0, cbv);
+
+        // bind and draw the vertex buffer
+        dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.vertex_buffer_view);
+        dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        dx12.CommandList->DrawInstanced(3, 1, 0, 0);
 
         return renderer_end_Frame();
     }
