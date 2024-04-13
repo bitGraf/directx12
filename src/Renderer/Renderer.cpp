@@ -25,34 +25,21 @@
 
 #include "Core/Logger.h"
 
-const char vert_shader_src[] = 
-"cbuffer cbPerObject : register(b0)\n"
-"{\n"
-"  float4x4 gWorldViewProj;\n"
-"};\n"
-"void VS(    float3 iPosL  : POSITION,\n"
-"            float4 iColor : COLOR,\n"
-"        out float4 oPosH  : SV_POSITION,\n"
-"        out float4 oColor : COLOR) {\n"
-"  // Transform to homogeneous clip space\n"
-"  oPosH = mul(float4(iPosL, 1.0f), gWorldViewProj);\n"
-"  oPosH.z = 0.5;\n"
-"\n"
-"  // Just pass vertex color into the pixel shader\n"
-"  oColor = iColor;\n"
-"}\n";
-
-const char pixel_shader_src[] = 
-"float4 PS (float4 posH  : SV_POSITION,\n"
-"           float4 color : COLOR) : SV_TARGET {\n"
-"  return color;\n"
-"}\n";
-
-struct cbLayout {
-    DirectX::XMFLOAT4X4 WorldViewProj = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
-                                                            0.0f, 1.0f, 0.0f, 0.0f,
-                                                            0.0f, 0.0f, 1.0f, 0.0f,
-                                                            0.0f, 0.0f, 0.0f, 1.0f);
+struct cbLayout_PerFrame {
+    DirectX::XMFLOAT4X4 r_Projection = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
+                                                           0.0f, 1.0f, 0.0f, 0.0f,
+                                                           0.0f, 0.0f, 1.0f, 0.0f,
+                                                           0.0f, 0.0f, 0.0f, 1.0f);
+    DirectX::XMFLOAT4X4 r_View       = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
+                                                           0.0f, 1.0f, 0.0f, 0.0f,
+                                                           0.0f, 0.0f, 1.0f, 0.0f,
+                                                           0.0f, 0.0f, 0.0f, 1.0f);
+};
+struct cbLayout_PerModel {
+    DirectX::XMFLOAT4X4 r_Model = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
+                                                      0.0f, 1.0f, 0.0f, 0.0f,
+                                                      0.0f, 0.0f, 1.0f, 0.0f,
+                                                      0.0f, 0.0f, 0.0f, 1.0f);
 };
 
 struct DX12State {
@@ -90,8 +77,9 @@ struct DX12State {
     D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view;
 
     // constant buffer
-    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer_PerFrame;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer_PerModel;
 
     // Pipeline State Object
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
@@ -513,42 +501,69 @@ bool init_renderer() {
     dx12.FenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
     AssertMsg(dx12.FenceEvent, "Failed to create fence event.");
 
-    // create constant buffer
+    // create constant buffer - PerFrame
     {
-        uint32 cbSize = sizeof(cbLayout);
+        uint32 cbSize = sizeof(cbLayout_PerFrame);
         cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
 
         auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
         auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize * 1);
         dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
                                              &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer));
+                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer_PerFrame));
 
         D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
-        cbv_desc.BufferLocation = dx12.upload_cbuffer->GetGPUVirtualAddress();
-        cbv_desc.SizeInBytes = cbSize;
+        cbv_desc.BufferLocation = dx12.upload_cbuffer_PerFrame->GetGPUVirtualAddress();
+        cbv_desc.SizeInBytes    = cbSize;
+        dx12.Device->CreateConstantBufferView(&cbv_desc, 
+                                              dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+    // create constant buffer - PerModel
+    {
+        uint32 cbSize = sizeof(cbLayout_PerModel);
+        cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
+
+        auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize * 1);
+        dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
+                                             &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer_PerModel));
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
+        cbv_desc.BufferLocation = dx12.upload_cbuffer_PerModel->GetGPUVirtualAddress();
+        cbv_desc.SizeInBytes    = cbSize;
         dx12.Device->CreateConstantBufferView(&cbv_desc, 
                                               dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
     // create root signature
     {
-        CD3DX12_ROOT_PARAMETER slot_root_parameter[1];
+        D3D12_ROOT_PARAMETER root_parameters[2];
+        
+        root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        root_parameters[0].Descriptor.ShaderRegister = 0;
+        root_parameters[0].Descriptor.RegisterSpace = 0;
 
-        CD3DX12_DESCRIPTOR_RANGE cbv_table;
-        cbv_table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
+        root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        root_parameters[1].Descriptor.ShaderRegister = 1;
+        root_parameters[1].Descriptor.RegisterSpace = 0;
 
-        slot_root_parameter[0].InitAsDescriptorTable(1, &cbv_table);
-
-        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(1, slot_root_parameter, 0, nullptr,
+        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(2, root_parameters, 0, nullptr,
                                                   D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
         ComPtr<ID3DBlob> serialized_root_sig = nullptr;
         ComPtr<ID3DBlob> error_blob          = nullptr;
-        HRESULT hr = D3D12SerializeRootSignature(&root_sig_desc,
-                                                 D3D_ROOT_SIGNATURE_VERSION_1_0,
-                                                 serialized_root_sig.GetAddressOf(),
-                                                 error_blob.GetAddressOf());
+        if FAILED(D3D12SerializeRootSignature(&root_sig_desc,
+                                              D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                              serialized_root_sig.GetAddressOf(),
+                                              error_blob.GetAddressOf())) {
+            RH_FATAL("Could not serialize root signature");
+            RH_FATAL("DxError: %s", error_blob->GetBufferPointer());
+            return false;
+        }
+
         if FAILED(dx12.Device->CreateRootSignature(0,
                                                    serialized_root_sig->GetBufferPointer(),
                                                    serialized_root_sig->GetBufferSize(),
@@ -644,36 +659,33 @@ bool init_renderer() {
     ComPtr<ID3DBlob> vs_bytecode;
     {
         ComPtr<ID3DBlob> vs_errors;
-        if FAILED(D3DCompile(vert_shader_src,
-                             sizeof(vert_shader_src),
-                             NULL,
-                             NULL,
-                             NULL,
-                             "VS",
-                             "vs_5_0",
-                             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
-                             0,
-                             &vs_bytecode,
-                             &vs_errors)) {
+        if FAILED(D3DCompileFromFile(L"../src/Shaders/color.hlsl",
+                                     NULL,
+                                     NULL,
+                                     "VS",
+                                     "vs_5_0",
+                                     D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                                     0,
+                                     &vs_bytecode,
+                                     &vs_errors)) {
             RH_FATAL("Failed to compile vertex shader");
             RH_FATAL("Errors: %s", (char*)vs_errors->GetBufferPointer());
             return false;
         }
     }
+
     ComPtr<ID3DBlob> ps_bytecode;
     {
         ComPtr<ID3DBlob> ps_errors;
-        if FAILED(D3DCompile(pixel_shader_src,
-                             sizeof(pixel_shader_src),
-                             NULL,
-                             NULL,
-                             NULL,
-                             "PS",
-                             "ps_5_0",
-                             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
-                             0,
-                             &ps_bytecode,
-                             &ps_errors)) {
+        if FAILED(D3DCompileFromFile(L"../src/Shaders/color.hlsl",
+                                     NULL,
+                                     NULL,
+                                     "PS",
+                                     "ps_5_0",
+                                     D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                                     0,
+                                     &ps_bytecode,
+                                     &ps_errors)) {
             RH_FATAL("Failed to compile pixel shader");
             RH_FATAL("Errors: %s", (char*)ps_errors->GetBufferPointer());
             return false;
@@ -918,27 +930,47 @@ bool renderer_draw_frame() {
             dx12.CommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
         }
 
-        // upload the constant buffer
+        DirectX::XMFLOAT4X4 eye(1.0f, 0.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f,
+                                0.0f, 0.0f, 1.0f, 0.0f,
+                                0.0f, 0.0f, 0.0f, 1.0f);
+        // upload the constant buffer - PerFrame
         {
-            cbLayout cbdata;
+            cbLayout_PerFrame cbdata;
+            cbdata.r_Projection = eye;
+            cbdata.r_View       = eye;
             size_t cbsize = sizeof(cbdata);
 
             BYTE* mapped_data = nullptr;
-            dx12.upload_cbuffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
+            dx12.upload_cbuffer_PerFrame->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
             memcpy(mapped_data, &cbdata, cbsize);
-            dx12.upload_cbuffer->Unmap(0, nullptr);
+            dx12.upload_cbuffer_PerFrame->Unmap(0, nullptr);
+        }
+
+        // upload the constant buffer - PerModel
+        {
+            cbLayout_PerModel cbdata;
+            cbdata.r_Model = eye;
+            size_t cbsize = sizeof(cbdata);
+
+            BYTE* mapped_data = nullptr;
+            dx12.upload_cbuffer_PerModel->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
+            memcpy(mapped_data, &cbdata, cbsize);
+            dx12.upload_cbuffer_PerModel->Unmap(0, nullptr);
         }
 
         dx12.CommandList->SetGraphicsRootSignature(dx12.root_signature.Get());
-        ID3D12DescriptorHeap* descriptorHeaps[] = {
-            dx12.CBVDescriptorHeap.Get()
-        };
-        dx12.CommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+        //ID3D12DescriptorHeap* descriptorHeaps[] = {
+        //    dx12.CBVDescriptorHeap.Get()
+        //};
+        //dx12.CommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
-        CD3DX12_GPU_DESCRIPTOR_HANDLE cbv(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-        cbv.Offset(0, dx12.CBVDescriptorSize);
+        //CD3DX12_GPU_DESCRIPTOR_HANDLE cbv(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+        //cbv.Offset(0, dx12.CBVDescriptorSize);
 
-        dx12.CommandList->SetGraphicsRootDescriptorTable(0, cbv);
+        //dx12.CommandList->SetGraphicsRootDescriptorTable(0, cbv);
+        dx12.CommandList->SetGraphicsRootConstantBufferView(0, dx12.upload_cbuffer_PerFrame->GetGPUVirtualAddress());
+        dx12.CommandList->SetGraphicsRootConstantBufferView(1, dx12.upload_cbuffer_PerModel->GetGPUVirtualAddress());
 
         // bind and draw the vertex buffer
         dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.vertex_buffer_view);

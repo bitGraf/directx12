@@ -40,6 +40,7 @@ bool32 engine_on_resize(uint16 code, void* sender, void* listener, event_context
 int WinMain() {
     printf("Hello, World!\n");
     InitLogging(true, log_level::LOG_LEVEL_TRACE);
+    platform_setup_paths();
 
     AppConfig config;
     config.application_name = "DX12 Test";
