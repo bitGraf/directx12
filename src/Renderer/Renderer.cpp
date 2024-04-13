@@ -24,22 +24,14 @@
 #include <chrono>
 
 #include "Core/Logger.h"
+#include "laml/laml.hpp"
 
 struct cbLayout_PerFrame {
-    DirectX::XMFLOAT4X4 r_Projection = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
-                                                           0.0f, 1.0f, 0.0f, 0.0f,
-                                                           0.0f, 0.0f, 1.0f, 0.0f,
-                                                           0.0f, 0.0f, 0.0f, 1.0f);
-    DirectX::XMFLOAT4X4 r_View       = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
-                                                           0.0f, 1.0f, 0.0f, 0.0f,
-                                                           0.0f, 0.0f, 1.0f, 0.0f,
-                                                           0.0f, 0.0f, 0.0f, 1.0f);
+    laml::Mat4 r_Projection;
+    laml::Mat4 r_View;
 };
 struct cbLayout_PerModel {
-    DirectX::XMFLOAT4X4 r_Model = DirectX::XMFLOAT4X4(1.0f, 0.0f, 0.0f, 0.0f,
-                                                      0.0f, 1.0f, 0.0f, 0.0f,
-                                                      0.0f, 0.0f, 1.0f, 0.0f,
-                                                      0.0f, 0.0f, 0.0f, 1.0f);
+    laml::Mat4 r_Model;
 };
 
 struct DX12State {
@@ -930,15 +922,17 @@ bool renderer_draw_frame() {
             dx12.CommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
         }
 
-        DirectX::XMFLOAT4X4 eye(1.0f, 0.0f, 0.0f, 0.0f,
-                                0.0f, 1.0f, 0.0f, 0.0f,
-                                0.0f, 0.0f, 1.0f, 0.0f,
-                                0.0f, 0.0f, 0.0f, 1.0f);
+        laml::Mat4 eye(1.0f);
         // upload the constant buffer - PerFrame
         {
             cbLayout_PerFrame cbdata;
-            cbdata.r_Projection = eye;
-            cbdata.r_View       = eye;
+
+            laml::transform::create_projection_perspective(cbdata.r_Projection, 60.0f, 8.0f / 6.0f, 0.01f, 100.0f);
+
+            laml::Mat4 cam_trans;
+            laml::transform::create_transform_translate(cam_trans, laml::Vec3(0.0f, 0.0f, 1.0f));
+            laml::transform::create_view_matrix_from_transform(cbdata.r_View, cam_trans);
+            
             size_t cbsize = sizeof(cbdata);
 
             BYTE* mapped_data = nullptr;
@@ -949,8 +943,12 @@ bool renderer_draw_frame() {
 
         // upload the constant buffer - PerModel
         {
+            static real32 t = 0.0f;
+            t += 1.0f / 60.0f;
+
             cbLayout_PerModel cbdata;
-            cbdata.r_Model = eye;
+            laml::transform::create_transform_rotation(cbdata.r_Model, t * 60.0f, 0.0f, 0.0f);
+
             size_t cbsize = sizeof(cbdata);
 
             BYTE* mapped_data = nullptr;
