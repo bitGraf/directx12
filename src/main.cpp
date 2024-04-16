@@ -138,7 +138,7 @@ int WinMain() {
 
                 // TODO: Untested! buggy
                 real32 SecondsElapsedForFrame = WorkSecondsElapsed;
-                bool32 LockFramerate = true;
+                bool32 LockFramerate = false;
                 if (LockFramerate) {
                     if (SecondsElapsedForFrame < engine.target_frame_time) {
                         uint64 SleepMS = (uint64)(1000.0f*(engine.target_frame_time - SecondsElapsedForFrame));
@@ -163,7 +163,7 @@ int WinMain() {
     
                 //Win32DisplayBufferToWindow(DeviceContext, Dimension.Width, Dimension.Height);
                 //platform_swap_buffers();
-                renderer_present();
+                //renderer_present();
     
                 FlipWallClock = platform_get_wall_clock();
 

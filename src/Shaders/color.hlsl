@@ -4,15 +4,19 @@
 // Transforms and colors geometry.
 //***************************************************************************************
 
-cbuffer cbPerFrame : register(b0)
-{
+#define BATCH_AMOUNT 1024
+
+cbuffer cbConstants : register(b0) {
+    uint batch_idx;
+};
+
+cbuffer cbPerFrame : register(b1) {
     float4x4 r_Projection;
     float4x4 r_View; 
 };
 
-cbuffer cbPerObject : register(b1)
-{
-    float4x4 r_Model; 
+cbuffer cbPerObject : register(b2) {
+    float4x4 r_Model[1024]; 
 };
 
 struct VertexIn
@@ -32,7 +36,7 @@ VertexOut VS(VertexIn vin)
     VertexOut vout;
 
     // Transform to homogeneous clip space.
-    vout.PosH = mul(mul(mul(r_Projection, r_View), r_Model), float4(vin.PosL, 1.0f));
+    vout.PosH = mul(mul(mul(r_Projection, r_View), r_Model[batch_idx]), float4(vin.PosL, 1.0f));
 
     // Just pass vertex color into the pixel shader.
     vout.Color = vin.Color;

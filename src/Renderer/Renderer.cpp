@@ -26,26 +26,35 @@
 #include "Core/Logger.h"
 #include "laml/laml.hpp"
 
+#define MAX_OBJECTS 1024
+
+struct cbLayout_Constants {
+    uint32 batch_idx;
+};
 struct cbLayout_PerFrame {
     laml::Mat4 r_Projection;
     laml::Mat4 r_View;
 };
 struct cbLayout_PerModel {
-    laml::Mat4 r_Model;
+    laml::Mat4 r_Model[MAX_OBJECTS];
 };
 
 struct DX12State {
     // DirectX 12 Objects
-    static const uint8                                  NumFramesInFlight = 3;
-    Microsoft::WRL::ComPtr<ID3D12Device2>               Device;
     Microsoft::WRL::ComPtr<ID3D12Debug>                 DebugController;
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Direct;
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Copy;
-    Microsoft::WRL::ComPtr<IDXGISwapChain4>             SwapChain;
-    Microsoft::WRL::ComPtr<ID3D12Resource>              BackBuffers[DX12State::NumFramesInFlight];
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>   CommandList;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>      CommandAllocators[DX12State::NumFramesInFlight];
+    DWORD                                               callback_cookie;
 
+    Microsoft::WRL::ComPtr<ID3D12Device2>               Device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Direct;
+    //Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Copy;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>   CommandList;
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain4>             SwapChain;
+    Microsoft::WRL::ComPtr<ID3D12Resource>              DepthStencilBuffer;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature>         RootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>         PSO;
+
+    // Descriptor Heaps
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        RTVDescriptorHeap;
     uint32                                              RTVDescriptorSize;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        DSVDescriptorHeap;
@@ -53,28 +62,25 @@ struct DX12State {
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        CBVDescriptorHeap;
     uint32                                              CBVDescriptorSize;
 
-    uint32                                              CurrentBackBufferIndex;
-
-    Microsoft::WRL::ComPtr<ID3D12Fence> Fence;
-    uint64 FenceValue = 0;
-    uint64 FrameFenceValues[DX12State::NumFramesInFlight] = {};
-    HANDLE FenceEvent;
-
-    Microsoft::WRL::ComPtr<ID3D12Resource> DepthStencilBuffer;
-
-    DWORD callback_cookie;
 
     // mesh and data
-    Microsoft::WRL::ComPtr<ID3D12Resource> vertex_buffer;
-    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view;
+    Microsoft::WRL::ComPtr<ID3D12Resource>              TriangleVB;
+    D3D12_VERTEX_BUFFER_VIEW                            TriangleVBView;
 
-    // constant buffer
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
-    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer_PerFrame;
-    Microsoft::WRL::ComPtr<ID3D12Resource> upload_cbuffer_PerModel;
 
-    // Pipeline State Object
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    // Frame Resources
+    uint32                                              frame_idx;
+    static const uint8                                  num_frames_in_flight = 3;
+    Microsoft::WRL::ComPtr<ID3D12Fence>                 Fence;
+    uint64                                              CurrentFence = 0;
+    struct FrameResources {
+        Microsoft::WRL::ComPtr<ID3D12Resource>          BackBuffer;
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator>  CommandAllocator;
+        Microsoft::WRL::ComPtr<ID3D12Resource>          upload_cbuffer_PerFrame;
+        Microsoft::WRL::ComPtr<ID3D12Resource>          upload_cbuffer_PerModel;
+
+        uint64                                          FenceValue = 0;
+    } frames[DX12State::num_frames_in_flight];
 };
 global_variable DX12State dx12;
 
@@ -91,25 +97,26 @@ void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category,
                             LPCSTR pDescription, 
                             void* pContext);
 
+// flush the current command queue and for for it to finish.
 void FlushCommandQueue()
 {
 	// Advance the fence value to mark commands up to this fence point.
-    dx12.FenceValue++;
+    dx12.frames[dx12.frame_idx].FenceValue = ++dx12.CurrentFence;
 
     // Add an instruction to the command queue to set a new fence point.  Because we 
     // are on the GPU timeline, the new fence point won't be set until the GPU finishes
     // processing all the commands prior to this Signal().
-    if FAILED(dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.FenceValue)) {
+    if FAILED(dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.frames[dx12.frame_idx].FenceValue)) {
         RH_FATAL("Failed to signal");
     }
 
 	// Wait until the GPU has completed commands up to this fence point.
-    if(dx12.Fence->GetCompletedValue() < dx12.FenceValue)
+    if(dx12.Fence->GetCompletedValue() < dx12.frames[dx12.frame_idx].FenceValue)
 	{
 		HANDLE eventHandle = CreateEventEx(nullptr, false, false, EVENT_ALL_ACCESS);
 
         // Fire event when GPU hits current fence.  
-        if FAILED(dx12.Fence->SetEventOnCompletion(dx12.FenceValue, eventHandle)) {
+        if FAILED(dx12.Fence->SetEventOnCompletion(dx12.frames[dx12.frame_idx].FenceValue, eventHandle)) {
             RH_FATAL("Failed to set event");
         }
 
@@ -292,15 +299,15 @@ bool init_renderer() {
         D3D12_COMMAND_QUEUE_DESC queue_desc = {};
 
         // copy queue
-        queue_desc.Type     = D3D12_COMMAND_LIST_TYPE_COPY;
-        queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-        queue_desc.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        queue_desc.NodeMask = 0;
-
-        if (FAILED(dx12.Device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&dx12.CommandQueue_Copy)))) {
-            RH_FATAL("Could not create copy queue");
-            return false;
-        }
+        //queue_desc.Type     = D3D12_COMMAND_LIST_TYPE_COPY;
+        //queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        //queue_desc.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        //queue_desc.NodeMask = 0;
+        //
+        //if (FAILED(dx12.Device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&dx12.CommandQueue_Copy)))) {
+        //    RH_FATAL("Could not create copy queue");
+        //    return false;
+        //}
 
         // direct queue
         queue_desc.Type     = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -323,7 +330,7 @@ bool init_renderer() {
         swapChainDesc.Stereo        = FALSE;
         swapChainDesc.SampleDesc    = { 1, 0 };
         swapChainDesc.BufferUsage   = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        swapChainDesc.BufferCount   = dx12.NumFramesInFlight;
+        swapChainDesc.BufferCount   = dx12.num_frames_in_flight;
         swapChainDesc.Scaling       = DXGI_SCALING_STRETCH;
         swapChainDesc.SwapEffect    = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         swapChainDesc.AlphaMode     = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -355,7 +362,7 @@ bool init_renderer() {
             return false;
         }
 
-        dx12.CurrentBackBufferIndex = dx12.SwapChain->GetCurrentBackBufferIndex();
+        dx12.frame_idx = dx12.SwapChain->GetCurrentBackBufferIndex();
     }
 
     // Query Descriptor Heap Sizes
@@ -366,7 +373,7 @@ bool init_renderer() {
     // Create Descriptor Heap
     { // RTV
         D3D12_DESCRIPTOR_HEAP_DESC desc = {};
-        desc.NumDescriptors = dx12.NumFramesInFlight;
+        desc.NumDescriptors = dx12.num_frames_in_flight;
         desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 
         if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.RTVDescriptorHeap))) {
@@ -403,7 +410,7 @@ bool init_renderer() {
     {
         CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(dx12.RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
-        for (int i = 0; i < dx12.NumFramesInFlight; ++i)
+        for (int i = 0; i < dx12.num_frames_in_flight; ++i)
         {
             ComPtr<ID3D12Resource> backBuffer;
             if FAILED(dx12.SwapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffer))) {
@@ -413,15 +420,17 @@ bool init_renderer() {
 
             dx12.Device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtvHandle);
 
-            dx12.BackBuffers[i] = backBuffer;
+            dx12.frames[i].BackBuffer = backBuffer;
 
             rtvHandle.Offset(dx12.RTVDescriptorSize);
+
+            //dx12.frames[i].FenceValue = i;
         }
     }
 
     // command allocators - one per frame
-    for (uint8 n = 0; n < dx12.NumFramesInFlight; n++) {
-        if (FAILED(dx12.Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&dx12.CommandAllocators[n])))) {
+    for (uint8 n = 0; n < dx12.num_frames_in_flight; n++) {
+        if (FAILED(dx12.Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&dx12.frames[n].CommandAllocator)))) {
             RH_FATAL("Could not create command allocators");
             return false;
         }
@@ -431,7 +440,7 @@ bool init_renderer() {
     {
         if FAILED(dx12.Device->CreateCommandList(0, 
                                             D3D12_COMMAND_LIST_TYPE_DIRECT, 
-                                            dx12.CommandAllocators[dx12.CurrentBackBufferIndex].Get(), 
+                                            dx12.frames[dx12.frame_idx].CommandAllocator.Get(), 
                                             nullptr, 
                                             IID_PPV_ARGS(dx12.CommandList.GetAddressOf()))) {
             RH_FATAL("Could not create command list!");
@@ -490,59 +499,65 @@ bool init_renderer() {
         return false;
     }
 
-    dx12.FenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
-    AssertMsg(dx12.FenceEvent, "Failed to create fence event.");
-
     // create constant buffer - PerFrame
-    {
-        uint32 cbSize = sizeof(cbLayout_PerFrame);
-        cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
+    for (uint32 n = 0; n < dx12.num_frames_in_flight; n++) {
+        {
+            uint32 cbSize = sizeof(cbLayout_PerFrame);
+            cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
 
-        auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-        auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize * 1);
-        dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
-                                             &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer_PerFrame));
+            auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+            dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
+                                                 &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                 nullptr, IID_PPV_ARGS(&dx12.frames[n].upload_cbuffer_PerFrame));
 
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
-        cbv_desc.BufferLocation = dx12.upload_cbuffer_PerFrame->GetGPUVirtualAddress();
-        cbv_desc.SizeInBytes    = cbSize;
-        dx12.Device->CreateConstantBufferView(&cbv_desc, 
-                                              dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
-    }
-    // create constant buffer - PerModel
-    {
-        uint32 cbSize = sizeof(cbLayout_PerModel);
-        cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
+            cbv_desc.BufferLocation = dx12.frames[n].upload_cbuffer_PerFrame->GetGPUVirtualAddress();
+            cbv_desc.SizeInBytes = cbSize;
+            dx12.Device->CreateConstantBufferView(&cbv_desc,
+                                                  dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+        }
 
-        auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-        auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize * 1);
-        dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
-                                             &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                             nullptr, IID_PPV_ARGS(&dx12.upload_cbuffer_PerModel));
+        // create constant buffer - PerModel
+        {
+            uint32 cbSize = sizeof(cbLayout_PerModel);
+            cbSize = (cbSize + 255) & ~255; // make it a multiple of 256, minimum alloc size
 
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
-        cbv_desc.BufferLocation = dx12.upload_cbuffer_PerModel->GetGPUVirtualAddress();
-        cbv_desc.SizeInBytes    = cbSize;
-        dx12.Device->CreateConstantBufferView(&cbv_desc, 
-                                              dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+            auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            auto desc = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+            dx12.Device->CreateCommittedResource(&prop, D3D12_HEAP_FLAG_NONE,
+                                                 &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                 nullptr, IID_PPV_ARGS(&dx12.frames[n].upload_cbuffer_PerModel));
+
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
+            cbv_desc.BufferLocation = dx12.frames[n].upload_cbuffer_PerModel->GetGPUVirtualAddress();
+            cbv_desc.SizeInBytes = cbSize;
+            dx12.Device->CreateConstantBufferView(&cbv_desc,
+                                                  dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+        }
     }
 
     // create root signature
     {
-        D3D12_ROOT_PARAMETER root_parameters[2];
+        D3D12_ROOT_PARAMETER root_parameters[3];
         
-        root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        root_parameters[0].Descriptor.ShaderRegister = 0;
+        root_parameters[0].Constants.ShaderRegister = 0;
         root_parameters[0].Descriptor.RegisterSpace = 0;
+        root_parameters[0].Constants.Num32BitValues = 1;
 
         root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         root_parameters[1].Descriptor.ShaderRegister = 1;
-        root_parameters[1].Descriptor.RegisterSpace = 0;
+        root_parameters[1].Descriptor.RegisterSpace  = 0;
 
-        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(2, root_parameters, 0, nullptr,
+        root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        root_parameters[2].Descriptor.ShaderRegister = 2;
+        root_parameters[2].Descriptor.RegisterSpace  = 0;
+
+        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(_countof(root_parameters), root_parameters, 0, nullptr,
                                                   D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
         ComPtr<ID3DBlob> serialized_root_sig = nullptr;
@@ -559,14 +574,14 @@ bool init_renderer() {
         if FAILED(dx12.Device->CreateRootSignature(0,
                                                    serialized_root_sig->GetBufferPointer(),
                                                    serialized_root_sig->GetBufferSize(),
-                                                   IID_PPV_ARGS(&dx12.root_signature))) {
+                                                   IID_PPV_ARGS(&dx12.RootSignature))) {
             RH_FATAL("Could not create root signature");
             return false;
         }
     }
 
     // load mesh data
-    auto alloc = dx12.CommandAllocators[dx12.CurrentBackBufferIndex];
+    auto alloc = dx12.frames[dx12.frame_idx].CommandAllocator;
     auto cmdlist = dx12.CommandList;
 
     alloc->Reset();
@@ -601,7 +616,7 @@ bool init_renderer() {
         dx12.Device->CreateCommittedResource(
             &prop, D3D12_HEAP_FLAG_NONE,
             &desc, D3D12_RESOURCE_STATE_COMMON,
-            nullptr, IID_PPV_ARGS(&dx12.vertex_buffer));
+            nullptr, IID_PPV_ARGS(&dx12.TriangleVB));
 
         // 2. create a temp upload buffer in the upload heap
         prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
@@ -618,20 +633,20 @@ bool init_renderer() {
         subResourceData.SlicePitch = subResourceData.RowPitch;
 
         // 4. schedule the copy into the default resource
-        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.vertex_buffer.Get(), 
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.TriangleVB.Get(), 
                                                                               D3D12_RESOURCE_STATE_COMMON, 
                                                                               D3D12_RESOURCE_STATE_COPY_DEST);
         cmdlist->ResourceBarrier(1, &barrier);
-        UpdateSubresources<1>(cmdlist.Get(), dx12.vertex_buffer.Get(), upload_buffer.Get(), 0, 0, 1, &subResourceData);
-        barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.vertex_buffer.Get(),
+        UpdateSubresources<1>(cmdlist.Get(), dx12.TriangleVB.Get(), upload_buffer.Get(), 0, 0, 1, &subResourceData);
+        barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.TriangleVB.Get(),
                                                        D3D12_RESOURCE_STATE_COPY_DEST,
                                                        D3D12_RESOURCE_STATE_GENERIC_READ);
         cmdlist->ResourceBarrier(1, &barrier);
 
         // initialize the vertex buffer view.
-        dx12.vertex_buffer_view.BufferLocation = dx12.vertex_buffer->GetGPUVirtualAddress();
-        dx12.vertex_buffer_view.StrideInBytes  = sizeof(Vertex);
-        dx12.vertex_buffer_view.SizeInBytes    = buf_size;
+        dx12.TriangleVBView.BufferLocation = dx12.TriangleVB->GetGPUVirtualAddress();
+        dx12.TriangleVBView.StrideInBytes  = sizeof(Vertex);
+        dx12.TriangleVBView.SizeInBytes    = buf_size;
 
         // Transition the resource from its initial state to be used as a depth buffer.
         auto t = CD3DX12_RESOURCE_BARRIER::Transition(dx12.DepthStencilBuffer.Get(),
@@ -687,7 +702,7 @@ bool init_renderer() {
     // Pipeline state object (PSO)
     {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = dx12.root_signature.Get();
+        desc.pRootSignature = dx12.RootSignature.Get();
 
         desc.VS.pShaderBytecode = vs_bytecode->GetBufferPointer();
         desc.VS.BytecodeLength  = vs_bytecode->GetBufferSize();
@@ -700,6 +715,7 @@ bool init_renderer() {
         desc.SampleMask = UINT_MAX;
 
         desc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 
         desc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
 
@@ -718,7 +734,7 @@ bool init_renderer() {
         desc.SampleDesc.Quality = 0;
 
         // create the pso
-        if FAILED(dx12.Device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&dx12.pso))) {
+        if FAILED(dx12.Device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&dx12.PSO))) {
             RH_FATAL("Failed to create PSO");
             return false;
         }
@@ -770,7 +786,8 @@ bool create_pipeline() {
 }
 
 void kill_renderer() {
-
+    // flush the command queues in case
+    FlushCommandQueue();
 }
 
 void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category,
@@ -805,50 +822,6 @@ void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category,
     LogOutput(level, "[%s] MsgId {%u} '%ls'", msg_cat, ID, pDescription);
 }
 
-bool renderer_present() {
-    auto backbuffer = dx12.BackBuffers[dx12.CurrentBackBufferIndex];
-    {
-        CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-            backbuffer.Get(),
-            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-        dx12.CommandList->ResourceBarrier(1, &barrier);
-
-        if FAILED(dx12.CommandList->Close()) {
-            RH_FATAL("Could not close command list.");
-            return false;
-        }
-
-        ID3D12CommandList* const commandLists[] = {
-            dx12.CommandList.Get()
-        };
-        dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(commandLists), commandLists);
-
-        uint32 syncInterval = 0;
-        uint32 presentFlags = 0;
-        if FAILED(dx12.SwapChain->Present(syncInterval, presentFlags)) {
-            RH_FATAL("Error presenting.");
-            return false;
-        }
-
-        // signal fence value
-        dx12.FenceValue++;
-        dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.FenceValue);
-        dx12.FrameFenceValues[dx12.CurrentBackBufferIndex] = dx12.FenceValue;
-
-        dx12.CurrentBackBufferIndex = dx12.SwapChain->GetCurrentBackBufferIndex();
-
-        // WaitForFenceValue
-        if (dx12.Fence->GetCompletedValue() < dx12.FrameFenceValues[dx12.CurrentBackBufferIndex]) {
-            dx12.Fence->SetEventOnCompletion(dx12.FrameFenceValues[dx12.CurrentBackBufferIndex], dx12.FenceEvent);
-
-            std::chrono::milliseconds duration = std::chrono::milliseconds::max();
-            ::WaitForSingleObject(dx12.FenceEvent, static_cast<DWORD>(duration.count()));
-        }
-    }
-
-    return true;
-}
-
 bool renderer_begin_Frame() {
     //ImGui::Begin("Renderer");
     //ImGui::Text("delta_time: %.2f ms", delta_time*1000.0f);
@@ -878,12 +851,58 @@ bool renderer_end_Frame() {
 
 bool renderer_draw_frame() {
     if (renderer_begin_Frame()) {
+        auto allocator  = dx12.frames[dx12.frame_idx].CommandAllocator;
+        auto backbuffer = dx12.frames[dx12.frame_idx].BackBuffer;
 
-        auto allocator = dx12.CommandAllocators[dx12.CurrentBackBufferIndex];
-        auto backbuffer = dx12.BackBuffers[dx12.CurrentBackBufferIndex];
+        // wait for new frame to be done on the GPU
+        uint64 completed_value = dx12.Fence->GetCompletedValue();
+        if (dx12.frames[dx12.frame_idx].FenceValue != 0 && dx12.Fence->GetCompletedValue() < dx12.frames[dx12.frame_idx].FenceValue) {
+            HANDLE event_handle = CreateEventEx(nullptr, false, false, EVENT_ALL_ACCESS);
+            dx12.Fence->SetEventOnCompletion(dx12.frames[dx12.frame_idx].FenceValue, event_handle);
+            ::WaitForSingleObject(event_handle, INFINITE);
+            ::CloseHandle(event_handle);
+        }
 
+        laml::Mat4 eye(1.0f);
+
+        // upload the constant buffer - PerFrame
+        {
+            cbLayout_PerFrame cbdata;
+
+            laml::transform::create_projection_perspective(cbdata.r_Projection, 60.0f, 8.0f / 6.0f, 0.01f, 100.0f);
+
+            laml::Mat4 cam_trans;
+            laml::transform::create_transform_translate(cam_trans, laml::Vec3(0.0f, 0.0f, 1.0f));
+            laml::transform::create_view_matrix_from_transform(cbdata.r_View, cam_trans);
+            
+            size_t cbsize = sizeof(cbdata);
+
+            BYTE* mapped_data = nullptr;
+            dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
+            memcpy(mapped_data, &cbdata, cbsize);
+            dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->Unmap(0, nullptr);
+        }
+
+        // upload the constant buffer - PerModel
+        {
+            static real32 t = 0.0f;
+            t += 1.0f / 60.0f;
+
+            cbLayout_PerModel cbdata;
+            laml::transform::create_transform_rotation(cbdata.r_Model[0], t *  60.0f, 0.0f, 0.0f);
+            laml::transform::create_transform_rotation(cbdata.r_Model[1], t * 120.0f, 0.0f, 0.0f);
+
+            size_t cbsize = sizeof(cbdata);
+
+            BYTE* mapped_data = nullptr;
+            dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
+            memcpy(mapped_data, &cbdata, cbsize);
+            dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->Unmap(0, nullptr);
+        }
+
+        // Start recording commands
         allocator->Reset();
-        dx12.CommandList->Reset(allocator.Get(), dx12.pso.Get());
+        dx12.CommandList->Reset(allocator.Get(), dx12.PSO.Get());
 
         // set viewport
         D3D12_VIEWPORT viewport;
@@ -899,7 +918,7 @@ bool renderer_draw_frame() {
         dx12.CommandList->RSSetScissorRects(1, &scissor);
 
         CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(dx12.RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
-                                          dx12.CurrentBackBufferIndex, dx12.RTVDescriptorSize);
+                                          dx12.frame_idx, dx12.RTVDescriptorSize);
         CD3DX12_CPU_DESCRIPTOR_HANDLE dsv(dx12.DSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
         // clear render target
@@ -922,42 +941,7 @@ bool renderer_draw_frame() {
             dx12.CommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
         }
 
-        laml::Mat4 eye(1.0f);
-        // upload the constant buffer - PerFrame
-        {
-            cbLayout_PerFrame cbdata;
-
-            laml::transform::create_projection_perspective(cbdata.r_Projection, 60.0f, 8.0f / 6.0f, 0.01f, 100.0f);
-
-            laml::Mat4 cam_trans;
-            laml::transform::create_transform_translate(cam_trans, laml::Vec3(0.0f, 0.0f, 1.0f));
-            laml::transform::create_view_matrix_from_transform(cbdata.r_View, cam_trans);
-            
-            size_t cbsize = sizeof(cbdata);
-
-            BYTE* mapped_data = nullptr;
-            dx12.upload_cbuffer_PerFrame->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
-            memcpy(mapped_data, &cbdata, cbsize);
-            dx12.upload_cbuffer_PerFrame->Unmap(0, nullptr);
-        }
-
-        // upload the constant buffer - PerModel
-        {
-            static real32 t = 0.0f;
-            t += 1.0f / 60.0f;
-
-            cbLayout_PerModel cbdata;
-            laml::transform::create_transform_rotation(cbdata.r_Model, t * 60.0f, 0.0f, 0.0f);
-
-            size_t cbsize = sizeof(cbdata);
-
-            BYTE* mapped_data = nullptr;
-            dx12.upload_cbuffer_PerModel->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
-            memcpy(mapped_data, &cbdata, cbsize);
-            dx12.upload_cbuffer_PerModel->Unmap(0, nullptr);
-        }
-
-        dx12.CommandList->SetGraphicsRootSignature(dx12.root_signature.Get());
+        dx12.CommandList->SetGraphicsRootSignature(dx12.RootSignature.Get());
         //ID3D12DescriptorHeap* descriptorHeaps[] = {
         //    dx12.CBVDescriptorHeap.Get()
         //};
@@ -966,16 +950,50 @@ bool renderer_draw_frame() {
         //CD3DX12_GPU_DESCRIPTOR_HANDLE cbv(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
         //cbv.Offset(0, dx12.CBVDescriptorSize);
 
-        //dx12.CommandList->SetGraphicsRootDescriptorTable(0, cbv);
-        dx12.CommandList->SetGraphicsRootConstantBufferView(0, dx12.upload_cbuffer_PerFrame->GetGPUVirtualAddress());
-        dx12.CommandList->SetGraphicsRootConstantBufferView(1, dx12.upload_cbuffer_PerModel->GetGPUVirtualAddress());
+        dx12.CommandList->SetGraphicsRootConstantBufferView(1, dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->GetGPUVirtualAddress());
+        dx12.CommandList->SetGraphicsRootConstantBufferView(2, dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->GetGPUVirtualAddress());
+
+        dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.TriangleVBView);
+        dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         // bind and draw the vertex buffer
-        dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.vertex_buffer_view);
-        dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        dx12.CommandList->SetGraphicsRoot32BitConstant(0, 0, 0);
         dx12.CommandList->DrawInstanced(3, 1, 0, 0);
 
-        return renderer_end_Frame();
+        dx12.CommandList->SetGraphicsRoot32BitConstant(0, 1, 0);
+        dx12.CommandList->DrawInstanced(3, 1, 0, 0);
+
+        //renderer_end_Frame();
+
+        {
+            CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                backbuffer.Get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+            dx12.CommandList->ResourceBarrier(1, &barrier);
+
+            if FAILED(dx12.CommandList->Close()) {
+                RH_FATAL("Could not close command list.");
+                return false;
+            }
+
+            ID3D12CommandList* const commandLists[] = {
+                dx12.CommandList.Get()
+            };
+            dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(commandLists), commandLists);
+
+            uint32 syncInterval = 0;
+            uint32 presentFlags = 0;
+            if FAILED(dx12.SwapChain->Present(syncInterval, presentFlags)) {
+                RH_FATAL("Error presenting.");
+                return false;
+            }
+
+            // signal fence value
+            dx12.frames[dx12.frame_idx].FenceValue = ++dx12.CurrentFence;
+            dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.frames[dx12.frame_idx].FenceValue);
+
+            dx12.frame_idx = dx12.SwapChain->GetCurrentBackBufferIndex();
+        }
     }
 
     return false;
