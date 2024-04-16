@@ -851,9 +851,6 @@ bool renderer_end_Frame() {
 
 bool renderer_draw_frame() {
     if (renderer_begin_Frame()) {
-        auto allocator  = dx12.frames[dx12.frame_idx].CommandAllocator;
-        auto backbuffer = dx12.frames[dx12.frame_idx].BackBuffer;
-
         // wait for new frame to be done on the GPU
         uint64 completed_value = dx12.Fence->GetCompletedValue();
         if (dx12.frames[dx12.frame_idx].FenceValue != 0 && dx12.Fence->GetCompletedValue() < dx12.frames[dx12.frame_idx].FenceValue) {
@@ -901,6 +898,9 @@ bool renderer_draw_frame() {
         }
 
         // Start recording commands
+        auto allocator  = dx12.frames[dx12.frame_idx].CommandAllocator;
+        auto backbuffer = dx12.frames[dx12.frame_idx].BackBuffer;
+
         allocator->Reset();
         dx12.CommandList->Reset(allocator.Get(), dx12.PSO.Get());
 
@@ -980,21 +980,24 @@ bool renderer_draw_frame() {
                 dx12.CommandList.Get()
             };
             dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(commandLists), commandLists);
-
-            uint32 syncInterval = 0;
-            uint32 presentFlags = 0;
-            if FAILED(dx12.SwapChain->Present(syncInterval, presentFlags)) {
-                RH_FATAL("Error presenting.");
-                return false;
-            }
-
-            // signal fence value
-            dx12.frames[dx12.frame_idx].FenceValue = ++dx12.CurrentFence;
-            dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.frames[dx12.frame_idx].FenceValue);
-
-            dx12.frame_idx = dx12.SwapChain->GetCurrentBackBufferIndex();
         }
     }
 
     return false;
 }
+
+bool renderer_present(uint32 sync_interval) {
+    const uint32 presentFlags = 0;
+    if FAILED(dx12.SwapChain->Present(sync_interval, presentFlags)) {
+        RH_FATAL("Error presenting.");
+        return false;
+    }
+
+    // signal fence value
+    dx12.frames[dx12.frame_idx].FenceValue = ++dx12.CurrentFence;
+    dx12.CommandQueue_Direct->Signal(dx12.Fence.Get(), dx12.frames[dx12.frame_idx].FenceValue);
+
+    dx12.frame_idx = dx12.SwapChain->GetCurrentBackBufferIndex();
+
+    return true;
+};

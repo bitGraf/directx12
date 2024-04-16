@@ -69,8 +69,8 @@ int WinMain() {
     CreateArena(&engine.engine_arena,       Megabytes(16), engine.engine_memory + Megabytes(16));
     CreateArena(&engine.resource_arena,     Megabytes(32), engine.engine_memory + Megabytes(32));
 
-    uint32 monitor_refresh_hz = 60;
-    uint32 target_framerate = 60;
+    //uint32 monitor_refresh_hz = 60;
+    uint32 target_framerate = 240;
 
     // renderer startup
     if (!init_renderer()) {
@@ -139,6 +139,7 @@ int WinMain() {
                 // TODO: Untested! buggy
                 real32 SecondsElapsedForFrame = WorkSecondsElapsed;
                 bool32 LockFramerate = false;
+                uint32 num_busy_sleep = 0;
                 if (LockFramerate) {
                     if (SecondsElapsedForFrame < engine.target_frame_time) {
                         uint64 SleepMS = (uint64)(1000.0f*(engine.target_frame_time - SecondsElapsedForFrame));
@@ -148,6 +149,7 @@ int WinMain() {
     
                         while (SecondsElapsedForFrame < engine.target_frame_time) {
                             SecondsElapsedForFrame = (real32)platform_get_seconds_elapsed(LastCounter, platform_get_wall_clock());
+                            num_busy_sleep++;
                         }
                     } else {
                         // TODO: Missed Frame Rate!
@@ -163,7 +165,7 @@ int WinMain() {
     
                 //Win32DisplayBufferToWindow(DeviceContext, Dimension.Width, Dimension.Height);
                 //platform_swap_buffers();
-                //renderer_present();
+                renderer_present(1);
     
                 FlipWallClock = platform_get_wall_clock();
 
@@ -177,7 +179,7 @@ int WinMain() {
                 #if 0
                 RH_TRACE("Frame: %.02f ms  %.02ffps\n", MSPerFrame, FPS);
                 #else
-                platform_console_set_title("%s: %.02f ms, FPS: %.02ffps", config.application_name, MSPerFrame, FPS);
+                platform_console_set_title("%s: %.02f ms, FPS: %7.02ffps [%3u]", config.application_name, MSPerFrame, FPS, num_busy_sleep);
                 #endif
 
                 input_update(engine.last_frame_time);
