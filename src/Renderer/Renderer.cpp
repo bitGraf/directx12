@@ -26,11 +26,13 @@
 #include "Core/Logger.h"
 #include "laml/laml.hpp"
 
-#define MAX_OBJECTS 1024
+#define str(x) #x
+#define ToString(x) str(x)
 
-struct cbLayout_Constants {
-    uint32 batch_idx;
-};
+
+#define MAX_OBJECTS 1024
+#define MAX_OBJECTS_STR ToString(MAX_OBJECTS)
+
 struct cbLayout_PerFrame {
     laml::Mat4 r_Projection;
     laml::Mat4 r_View;
@@ -44,10 +46,10 @@ struct DX12State {
     Microsoft::WRL::ComPtr<ID3D12Debug>                 DebugController;
     DWORD                                               callback_cookie;
 
-    Microsoft::WRL::ComPtr<ID3D12Device2>               Device;
+    Microsoft::WRL::ComPtr<ID3D12Device5>               Device;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Direct;
     //Microsoft::WRL::ComPtr<ID3D12CommandQueue>          CommandQueue_Copy;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>   CommandList;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4>  CommandList;
 
     Microsoft::WRL::ComPtr<IDXGISwapChain4>             SwapChain;
     Microsoft::WRL::ComPtr<ID3D12Resource>              DepthStencilBuffer;
@@ -76,10 +78,18 @@ struct DX12State {
     struct FrameResources {
         Microsoft::WRL::ComPtr<ID3D12Resource>          BackBuffer;
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator>  CommandAllocator;
+        
         Microsoft::WRL::ComPtr<ID3D12Resource>          upload_cbuffer_PerFrame;
+        BYTE*                                           upload_cbuffer_PerFrame_mapped = nullptr;
+
         Microsoft::WRL::ComPtr<ID3D12Resource>          upload_cbuffer_PerModel;
+        BYTE*                                           upload_cbuffer_PerModel_mapped = nullptr;
 
         uint64                                          FenceValue = 0;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource>          DynamicVB;
+        D3D12_VERTEX_BUFFER_VIEW                        DynamicVBView;
+        BYTE*                                           DynamicVB_mapped = nullptr;
     } frames[DX12State::num_frames_in_flight];
 };
 global_variable DX12State dx12;
@@ -89,6 +99,37 @@ struct RenderState {
     uint32 render_height = 600;
 };
 global_variable RenderState render;
+
+struct Vertex
+{
+    DirectX::XMFLOAT3 position;
+    DirectX::XMFLOAT4 color;
+};
+const uint32 num_circle_verts = 16;
+void generate_circle_verts(Vertex* verts, uint32 N, real32 t) {
+    // for each edge vertex, we create a triangle with the center (0,0), 
+    // that vertex, and the next vertex. If we are on vertex N-1, 'next' vertex
+    // is vertex 0.
+    real32 dtheta = 360.0f / static_cast<real32>(N);
+    for (uint32 n = 0; n < N; n++) {
+        uint32 next = n + 1;
+        if (next == N) next = 0;
+
+        real32 theta1 = t + n    * dtheta;
+        real32 radius1 = 0.3f + 0.15f * laml::cosd(t*theta1/10.0f);
+        real32 theta2 = t + next * dtheta;
+        real32 radius2 = 0.3f + 0.15f * laml::cosd(t*theta2/10.0f);
+
+        verts[3*n + 0].position = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+        verts[3*n + 0].color    = DirectX::XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
+
+        verts[3*n + 1].position = DirectX::XMFLOAT3(-radius1*laml::sind(theta1), radius1*laml::cosd(theta1), 0.0f);
+        verts[3*n + 1].color    = DirectX::XMFLOAT4(0.0f, 1.0f, 0.0f, 1.0f);
+
+        verts[3*n + 2].position = DirectX::XMFLOAT3(-radius1*laml::sind(theta2), radius1*laml::cosd(theta2), 0.0f);
+        verts[3*n + 2].color    = DirectX::XMFLOAT4(0.0f, 0.0f, 1.0f, 1.0f);
+    }
+}
 
 // callbacks
 void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category, 
@@ -165,7 +206,7 @@ bool init_renderer() {
             DXGI_ADAPTER_DESC1 desc;
             adapter->GetDesc1(&desc);
 
-            RH_INFO("Device %d: %ls", i, desc.Description);
+            RH_TRACE("Device %d: %ls", i, desc.Description);
             if (desc.DedicatedVideoMemory > max_vram) {
                 max_vram = desc.DedicatedVideoMemory;
                 max_idx = i;
@@ -183,14 +224,58 @@ bool init_renderer() {
         // print out description of selected adapter
         DXGI_ADAPTER_DESC desc;
         adapter->GetDesc(&desc);
-        RH_INFO("Chosen Device: [%d] '%ls', %.1llf GB", max_idx, desc.Description, ((double)desc.DedicatedVideoMemory) / (1024.0*1024.0*1024.0));
+        RH_INFO("Chosen Device: '%ls'"
+        "\n         VideoMemory:  %.1llf GB"
+        "\n         SystemMemory: %.1llf GB"
+                , desc.Description, ((double)desc.DedicatedVideoMemory) / (1024.0*1024.0*1024.0));
     }
 
     // create Device
     {
-        if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dx12.Device))) {
-            RH_FATAL("Failed to create Device!");
-            return false;
+        if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_2, IID_PPV_ARGS(&dx12.Device))) {
+            if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&dx12.Device))) {
+                if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dx12.Device))) {
+                    if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_1, IID_PPV_ARGS(&dx12.Device))) {
+                        if FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dx12.Device))) {
+                            RH_FATAL("No feature levels supported, could not create a DX12 Device!");
+                            return false;
+                        } else {
+                            RH_INFO("Created a DX12 Device with Feature Level: 11_0");
+                        }
+                    } else {
+                        RH_INFO("Created a DX12 Device with Feature Level: 11_1");
+                    }
+                } else {
+                    RH_INFO("Created a DX12 Device with Feature Level: 12_0");
+                }
+            } else {
+                RH_INFO("Created a DX12 Device with Feature Level: 12_1");
+            }
+        } else {
+            RH_INFO("Created a DX12 Device with Feature Level: 12_2");
+        }
+
+        static const D3D_FEATURE_LEVEL FEATURE_LEVELS_ARRAY[] =
+        {
+            D3D_FEATURE_LEVEL_12_2,
+            D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0,
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+        };
+        static const D3D_FEATURE_LEVEL MAX_FEATURE_LEVEL = D3D_FEATURE_LEVEL_12_2;
+        static const D3D_FEATURE_LEVEL MIN_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_0;
+
+        D3D12_FEATURE_DATA_FEATURE_LEVELS levels = {
+            _countof(FEATURE_LEVELS_ARRAY), FEATURE_LEVELS_ARRAY, MAX_FEATURE_LEVEL
+        };
+        dx12.Device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof(levels));
+
+        // check for raytracing support
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 opt5 = {};
+        dx12.Device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opt5, sizeof(opt5));
+        if (opt5.RaytracingTier) {
+            RH_INFO("Feature: Raytracing Tier: %.1f", (real32)opt5.RaytracingTier / 10.0f);
         }
 
         // enable debug messages
@@ -516,6 +601,12 @@ bool init_renderer() {
             cbv_desc.SizeInBytes = cbSize;
             dx12.Device->CreateConstantBufferView(&cbv_desc,
                                                   dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+            // map the cbuffer so we have a memory address.
+            // Keep this mapped until the program exits
+            dx12.frames[n].upload_cbuffer_PerFrame->Map(0, 
+                                                        nullptr, 
+                                                        reinterpret_cast<void**>(&dx12.frames[n].upload_cbuffer_PerFrame_mapped));
         }
 
         // create constant buffer - PerModel
@@ -534,6 +625,19 @@ bool init_renderer() {
             cbv_desc.SizeInBytes = cbSize;
             dx12.Device->CreateConstantBufferView(&cbv_desc,
                                                   dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+            // map the cbuffer so we have a memory address.
+            // Keep this mapped until the program exits
+            dx12.frames[n].upload_cbuffer_PerModel->Map(0, 
+                                                        nullptr, 
+                                                        reinterpret_cast<void**>(&dx12.frames[n].upload_cbuffer_PerModel_mapped));
+
+            // fill each buffer with an identity matrix
+            cbLayout_PerModel cbdata;
+            for (uint32 m = 0; m < MAX_OBJECTS; m++) {
+                laml::identity(cbdata.r_Model[m]);
+            }
+            memcpy(dx12.frames[n].upload_cbuffer_PerModel_mapped, &cbdata, sizeof(cbdata));
         }
     }
 
@@ -591,14 +695,9 @@ bool init_renderer() {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
-    {
-        struct Vertex
-        {
-            DirectX::XMFLOAT3 position;
-            DirectX::XMFLOAT4 color;
-        };
 
-        // Define the geometry for a triangle.
+    // Define the geometry for a static triangle.
+    {
         Vertex vertex_data[] =
         {
             { {  0.0f,   0.25f, 0.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
@@ -655,6 +754,36 @@ bool init_renderer() {
         cmdlist->ResourceBarrier(1, &t);
     }
 
+    // Define the geometry for a dynamic vertex buffer
+    {
+        // generate vertices for a circle
+        Vertex circle_verts[num_circle_verts * 3];
+
+        generate_circle_verts(circle_verts, num_circle_verts, 0.0f);
+        const UINT buf_size = sizeof(circle_verts);
+
+        // Since this data changes, we store it in the upload heap always
+
+        for (uint32 n = 0; n < dx12.num_frames_in_flight; n++) {
+            auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            auto desc = CD3DX12_RESOURCE_DESC::Buffer(buf_size);
+            dx12.Device->CreateCommittedResource(
+                &prop, D3D12_HEAP_FLAG_NONE,
+                &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&dx12.frames[n].DynamicVB));
+
+            dx12.frames[n].DynamicVBView.BufferLocation = dx12.frames[n].DynamicVB->GetGPUVirtualAddress();
+            dx12.frames[n].DynamicVBView.StrideInBytes = sizeof(Vertex);
+            dx12.frames[n].DynamicVBView.SizeInBytes = buf_size;
+
+            dx12.frames[n].DynamicVB->Map(0,
+                                                       nullptr,
+                                                       reinterpret_cast<void**>(&dx12.frames[n].DynamicVB_mapped));
+
+            memcpy(dx12.frames[n].DynamicVB_mapped, circle_verts, buf_size);
+        }
+    }
+
     // Execute the initialization commands.
     if FAILED(cmdlist->Close()) {
         RH_FATAL("Failed to close command list");
@@ -662,12 +791,24 @@ bool init_renderer() {
     ID3D12CommandList* cmdsLists[] = { cmdlist.Get() };
     dx12.CommandQueue_Direct->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
 
+    // set shader compile definitions:
+    // #define BATCH_AMOUNT 1024
+    D3D_SHADER_MACRO shader_defines[] = {
+        { "BATCH_AMOUNT", MAX_OBJECTS_STR },
+        {  NULL,           NULL}
+    };
+
+    RH_DEBUG("Shader defines: %d", _countof(shader_defines)-1);
+    for (uint32 n = 0; n < _countof(shader_defines)-1; n++) {
+        RH_DEBUG("  '%s' = '%s'", shader_defines[n].Name, shader_defines[n].Definition);
+    }
+
     // compile shaders
     ComPtr<ID3DBlob> vs_bytecode;
     {
         ComPtr<ID3DBlob> vs_errors;
         if FAILED(D3DCompileFromFile(L"../src/Shaders/color.hlsl",
-                                     NULL,
+                                     shader_defines,
                                      NULL,
                                      "VS",
                                      "vs_5_0",
@@ -685,7 +826,7 @@ bool init_renderer() {
     {
         ComPtr<ID3DBlob> ps_errors;
         if FAILED(D3DCompileFromFile(L"../src/Shaders/color.hlsl",
-                                     NULL,
+                                     shader_defines,
                                      NULL,
                                      "PS",
                                      "ps_5_0",
@@ -788,6 +929,15 @@ bool create_pipeline() {
 void kill_renderer() {
     // flush the command queues in case
     FlushCommandQueue();
+
+    // unmap constant buffers
+    for (uint32 n = 0; n < dx12.num_frames_in_flight; n++) {
+        dx12.frames[n].upload_cbuffer_PerFrame->Unmap(0, nullptr);
+        dx12.frames[n].upload_cbuffer_PerFrame_mapped = nullptr;
+
+        dx12.frames[n].upload_cbuffer_PerModel->Unmap(0, nullptr);
+        dx12.frames[n].upload_cbuffer_PerModel_mapped = nullptr;
+    }
 }
 
 void d3d_debug_msg_callback(D3D12_MESSAGE_CATEGORY Category,
@@ -851,6 +1001,10 @@ bool renderer_end_Frame() {
 
 bool renderer_draw_frame() {
     if (renderer_begin_Frame()) {
+        // keep track of time (poorly cx)
+        static real32 t = 0.0f;
+        t += 1.0f / 60.0f;
+
         // wait for new frame to be done on the GPU
         uint64 completed_value = dx12.Fence->GetCompletedValue();
         if (dx12.frames[dx12.frame_idx].FenceValue != 0 && dx12.Fence->GetCompletedValue() < dx12.frames[dx12.frame_idx].FenceValue) {
@@ -873,28 +1027,28 @@ bool renderer_draw_frame() {
             laml::transform::create_view_matrix_from_transform(cbdata.r_View, cam_trans);
             
             size_t cbsize = sizeof(cbdata);
-
-            BYTE* mapped_data = nullptr;
-            dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
-            memcpy(mapped_data, &cbdata, cbsize);
-            dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->Unmap(0, nullptr);
+            memcpy(dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame_mapped, &cbdata, cbsize);
         }
 
         // upload the constant buffer - PerModel
         {
-            static real32 t = 0.0f;
-            t += 1.0f / 60.0f;
-
             cbLayout_PerModel cbdata;
             laml::transform::create_transform_rotation(cbdata.r_Model[0], t *  60.0f, 0.0f, 0.0f);
             laml::transform::create_transform_rotation(cbdata.r_Model[1], t * 120.0f, 0.0f, 0.0f);
 
-            size_t cbsize = sizeof(cbdata);
+            size_t cbsize = sizeof(cbdata.r_Model[0]) * 2; // only the first 2 change
+            memcpy(dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel_mapped, &cbdata, cbsize);
+        }
 
-            BYTE* mapped_data = nullptr;
-            dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->Map(0, nullptr, reinterpret_cast<void**>(&mapped_data));
-            memcpy(mapped_data, &cbdata, cbsize);
-            dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->Unmap(0, nullptr);
+        // update dynamic vertex buffer
+        {
+            // generate vertices for a circle
+            Vertex circle_verts[num_circle_verts * 3];
+
+            generate_circle_verts(circle_verts, num_circle_verts, t);
+            const UINT buf_size = sizeof(circle_verts);
+
+            memcpy(dx12.frames[dx12.frame_idx].DynamicVB_mapped, circle_verts, buf_size);
         }
 
         // Start recording commands
@@ -958,10 +1112,16 @@ bool renderer_draw_frame() {
 
         // bind and draw the vertex buffer
         dx12.CommandList->SetGraphicsRoot32BitConstant(0, 0, 0);
-        dx12.CommandList->DrawInstanced(3, 1, 0, 0);
+        //dx12.CommandList->DrawInstanced(3, 1, 0, 0);
 
         dx12.CommandList->SetGraphicsRoot32BitConstant(0, 1, 0);
-        dx12.CommandList->DrawInstanced(3, 1, 0, 0);
+        //dx12.CommandList->DrawInstanced(3, 1, 0, 0);
+
+        // set new vertex buffer
+        dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.frames[dx12.frame_idx].DynamicVBView);
+
+        dx12.CommandList->SetGraphicsRoot32BitConstant(0, 2, 0);
+        dx12.CommandList->DrawInstanced(num_circle_verts * 3, 1, 0, 0);
 
         //renderer_end_Frame();
 

@@ -4,7 +4,7 @@
 // Transforms and colors geometry.
 //***************************************************************************************
 
-#define BATCH_AMOUNT 1024
+// #define BATCH_AMOUNT 1024 // <- set outside shader
 
 cbuffer cbConstants : register(b0) {
     uint batch_idx;
@@ -16,7 +16,7 @@ cbuffer cbPerFrame : register(b1) {
 };
 
 cbuffer cbPerObject : register(b2) {
-    float4x4 r_Model[1024]; 
+    float4x4 r_Model[BATCH_AMOUNT]; 
 };
 
 struct VertexIn

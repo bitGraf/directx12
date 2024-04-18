@@ -182,6 +182,7 @@ LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo)
     {
         case DBG_PRINTEXCEPTION_WIDE_C:
         case DBG_PRINTEXCEPTION_C:
+        //case 0x0000087a:
 
             if (ExceptionRecord->NumberParameters >= 2)
             {
@@ -222,7 +223,9 @@ LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo)
                 }
 
             }
-            return EXCEPTION_CONTINUE_EXECUTION;
+            //return EXCEPTION_CONTINUE_EXECUTION;
+            //return EXCEPTION_EXECUTE_HANDLER;
+            return EXCEPTION_EXECUTE_HANDLER;
     }
 
     return EXCEPTION_CONTINUE_SEARCH;

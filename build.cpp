@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
     target_config targ;
     targ.target_name = "test";
     targ.type = executable;
-    targ.defines = { "_DEBUG", "RH_INTERNAL", "RH_PLATFORM_WINDOWS" };
+    targ.defines = { "RH_INTERNAL", "RH_PLATFORM_WINDOWS" };
     targ.link_dir = "bin";
     targ.link_libs = {"user32.lib", "Gdi32.lib", "Winmm.lib", "Shlwapi.lib", "Shell32.lib", "D3D12.lib", "DXGI.lib", "dxguid.lib", "d3dcompiler.lib"};
     targ.include_dirs = relative_dirs("src", "deps/math_lib/include", "deps/DirectX-Headers/include");

@@ -119,6 +119,7 @@ int WinMain() {
 
         ////////////////////////////////////////////////////////////////////////////////////////
         // app initialize
+        engine.is_paused = false;
 
         // Game Loop!
         RH_INFO("------ Starting Main Loop ----------------------");
@@ -132,6 +133,7 @@ int WinMain() {
 
                 // render scene
                 renderer_draw_frame();
+                renderer_present(1); // note: runs wayyy faster if its here?
 
                 uint64 WorkCounter = platform_get_wall_clock();
                 real32 WorkSecondsElapsed = (real32)platform_get_seconds_elapsed(LastCounter, WorkCounter);
@@ -165,7 +167,7 @@ int WinMain() {
     
                 //Win32DisplayBufferToWindow(DeviceContext, Dimension.Width, Dimension.Height);
                 //platform_swap_buffers();
-                renderer_present(1);
+                //renderer_present(0);
     
                 FlipWallClock = platform_get_wall_clock();
 
@@ -214,6 +216,8 @@ bool32 engine_on_event(uint16 code, void* sender, void* listener, event_context 
             if (context.u16[0] == KEY_ESCAPE) {
                 event_context no_data = {};
                 event_fire(EVENT_CODE_APPLICATION_QUIT, 0, no_data);
+            } else if (context.u16[0] == KEY_P) {
+                engine.is_paused = !engine.is_paused;
             } else if (context.u16[0] == KEY_F1) {
                 engine.debug_mode = !engine.debug_mode;
                 RH_INFO("Debug Mode: %s", engine.debug_mode ? "Enabled" : "Disabled");
