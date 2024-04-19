@@ -11,6 +11,8 @@
 #include <dxgi1_6.h>
 #include <wrl.h>
 
+#include "Renderer/DDSTextureLoader12.h"
+
 #if defined(min)
 #undef min
 #endif
@@ -64,11 +66,15 @@ struct DX12State {
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        CBVDescriptorHeap;
     uint32                                              CBVDescriptorSize;
 
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        SamDescriptorHeap;
+
 
     // mesh and data
     Microsoft::WRL::ComPtr<ID3D12Resource>              TriangleVB;
     D3D12_VERTEX_BUFFER_VIEW                            TriangleVBView;
 
+    // texture
+    Microsoft::WRL::ComPtr<ID3D12Resource>              Texture;
 
     // Frame Resources
     uint32                                              frame_idx;
@@ -103,7 +109,8 @@ global_variable RenderState render;
 struct Vertex
 {
     DirectX::XMFLOAT3 position;
-    DirectX::XMFLOAT4 color;
+    DirectX::XMFLOAT3 color;
+    DirectX::XMFLOAT2 texcoord;
 };
 const uint32 num_circle_verts = 16;
 void generate_circle_verts(Vertex* verts, uint32 N, real32 t) {
@@ -120,14 +127,24 @@ void generate_circle_verts(Vertex* verts, uint32 N, real32 t) {
         real32 theta2 = t + next * dtheta;
         real32 radius2 = 0.3f + 0.15f * laml::cosd(t*theta2/10.0f);
 
+        float x, y;
         verts[3*n + 0].position = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
-        verts[3*n + 0].color    = DirectX::XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
+        verts[3*n + 0].color    = DirectX::XMFLOAT3(1.0f, 0.6f, 0.6f);
+        x = verts[3*n].position.x;
+        y = verts[3*n].position.y;
+        verts[3*n + 0].texcoord = DirectX::XMFLOAT2(0.5f*(x + 1.0f), 0.5f*(y + 1.0f));
 
         verts[3*n + 1].position = DirectX::XMFLOAT3(-radius1*laml::sind(theta1), radius1*laml::cosd(theta1), 0.0f);
-        verts[3*n + 1].color    = DirectX::XMFLOAT4(0.0f, 1.0f, 0.0f, 1.0f);
+        verts[3*n + 1].color    = DirectX::XMFLOAT3(0.6f, 1.0f, 0.6f);
+        x = verts[3*n + 1].position.x;
+        y = verts[3*n + 1].position.y;
+        verts[3*n + 1].texcoord = DirectX::XMFLOAT2(0.5f*(x + 1.0f), 0.5f*(y + 1.0f));
 
         verts[3*n + 2].position = DirectX::XMFLOAT3(-radius1*laml::sind(theta2), radius1*laml::cosd(theta2), 0.0f);
-        verts[3*n + 2].color    = DirectX::XMFLOAT4(0.0f, 0.0f, 1.0f, 1.0f);
+        verts[3*n + 2].color    = DirectX::XMFLOAT3(0.6f, 0.6f, 1.0f);
+        x = verts[3*n + 2].position.x;
+        y = verts[3*n + 2].position.y;
+        verts[3*n + 2].texcoord = DirectX::XMFLOAT2(0.5f*(x + 1.0f), 0.5f*(y + 1.0f));
     }
 }
 
@@ -466,7 +483,7 @@ bool init_renderer() {
             return false;
         }
     }
-    { // CBV
+    { // CBV/SRV/UAV
         D3D12_DESCRIPTOR_HEAP_DESC desc = {};
         desc.NumDescriptors = 1;
         desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -486,6 +503,18 @@ bool init_renderer() {
         desc.NodeMask       = 0;
 
         if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.DSVDescriptorHeap))) {
+            RH_FATAL("Failed making descriptor heap");
+            return false;
+        }
+    }
+    { // Samplers
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+        desc.NumDescriptors = 1;
+        desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        desc.NodeMask       = 0;
+
+        if FAILED(dx12.Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&dx12.SamDescriptorHeap))) {
             RH_FATAL("Failed making descriptor heap");
             return false;
         }
@@ -599,8 +628,10 @@ bool init_renderer() {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
             cbv_desc.BufferLocation = dx12.frames[n].upload_cbuffer_PerFrame->GetGPUVirtualAddress();
             cbv_desc.SizeInBytes = cbSize;
-            dx12.Device->CreateConstantBufferView(&cbv_desc,
-                                                  dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+            CD3DX12_CPU_DESCRIPTOR_HANDLE heap(dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+                                               0, dx12.CBVDescriptorSize);
+            //dx12.Device->CreateConstantBufferView(&cbv_desc, heap);
 
             // map the cbuffer so we have a memory address.
             // Keep this mapped until the program exits
@@ -623,8 +654,11 @@ bool init_renderer() {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
             cbv_desc.BufferLocation = dx12.frames[n].upload_cbuffer_PerModel->GetGPUVirtualAddress();
             cbv_desc.SizeInBytes = cbSize;
-            dx12.Device->CreateConstantBufferView(&cbv_desc,
-                                                  dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+            CD3DX12_CPU_DESCRIPTOR_HANDLE heap(dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+                                               1,
+                                               dx12.CBVDescriptorSize);
+            //dx12.Device->CreateConstantBufferView(&cbv_desc, heap);
 
             // map the cbuffer so we have a memory address.
             // Keep this mapped until the program exits
@@ -643,12 +677,12 @@ bool init_renderer() {
 
     // create root signature
     {
-        D3D12_ROOT_PARAMETER root_parameters[3];
+        D3D12_ROOT_PARAMETER root_parameters[5];
         
         root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         root_parameters[0].Constants.ShaderRegister = 0;
-        root_parameters[0].Descriptor.RegisterSpace = 0;
+        root_parameters[0].Constants.RegisterSpace  = 0;
         root_parameters[0].Constants.Num32BitValues = 1;
 
         root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -661,7 +695,32 @@ bool init_renderer() {
         root_parameters[2].Descriptor.ShaderRegister = 2;
         root_parameters[2].Descriptor.RegisterSpace  = 0;
 
-        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(_countof(root_parameters), root_parameters, 0, nullptr,
+        D3D12_DESCRIPTOR_RANGE srv_range = {};
+        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors = 1;
+        srv_range.BaseShaderRegister = 0;
+        srv_range.RegisterSpace = 0;
+        srv_range.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_DESCRIPTOR_RANGE sampler_range = {};
+        sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        sampler_range.NumDescriptors = 1;
+        sampler_range.BaseShaderRegister = 0;
+        sampler_range.RegisterSpace = 0;
+        sampler_range.OffsetInDescriptorsFromTableStart = 0;
+
+        root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_parameters[3].DescriptorTable.NumDescriptorRanges = 1;
+        root_parameters[3].DescriptorTable.pDescriptorRanges = &srv_range;
+
+        root_parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_parameters[4].DescriptorTable.NumDescriptorRanges = 1;
+        root_parameters[4].DescriptorTable.pDescriptorRanges = &sampler_range;
+
+        CD3DX12_ROOT_SIGNATURE_DESC root_sig_desc(_countof(root_parameters), root_parameters, 
+                                                  0, nullptr, // static samplers
                                                   D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
         ComPtr<ID3DBlob> serialized_root_sig = nullptr;
@@ -690,19 +749,20 @@ bool init_renderer() {
 
     alloc->Reset();
     cmdlist->Reset(alloc.Get(), nullptr);
-    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer_triangleVB;
     D3D12_INPUT_ELEMENT_DESC vert_desc[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
 
     // Define the geometry for a static triangle.
     {
         Vertex vertex_data[] =
         {
-            { {  0.0f,   0.25f, 0.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-            { {  0.25f, -0.25f, 0.0f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
-            { { -0.25f, -0.25f, 0.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } }
+            { {  0.0f,   0.25f, 0.0f }, { 1.0f, 0.0f, 0.0f }, { 0.0f, 0.0f } },
+            { {  0.25f, -0.25f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f } },
+            { { -0.25f, -0.25f, 0.0f }, { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f } }
         };
 
         const UINT buf_size = sizeof(vertex_data);
@@ -723,7 +783,7 @@ bool init_renderer() {
         dx12.Device->CreateCommittedResource(
             &prop, D3D12_HEAP_FLAG_NONE,
             &desc, D3D12_RESOURCE_STATE_GENERIC_READ, 
-            nullptr, IID_PPV_ARGS(&upload_buffer));
+            nullptr, IID_PPV_ARGS(&upload_buffer_triangleVB));
 
         // 3. describe the data we wish to copy to the gpu
         D3D12_SUBRESOURCE_DATA subResourceData = {};
@@ -736,7 +796,7 @@ bool init_renderer() {
                                                                               D3D12_RESOURCE_STATE_COMMON, 
                                                                               D3D12_RESOURCE_STATE_COPY_DEST);
         cmdlist->ResourceBarrier(1, &barrier);
-        UpdateSubresources<1>(cmdlist.Get(), dx12.TriangleVB.Get(), upload_buffer.Get(), 0, 0, 1, &subResourceData);
+        UpdateSubresources<1>(cmdlist.Get(), dx12.TriangleVB.Get(), upload_buffer_triangleVB.Get(), 0, 0, 1, &subResourceData);
         barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.TriangleVB.Get(),
                                                        D3D12_RESOURCE_STATE_COPY_DEST,
                                                        D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -752,6 +812,87 @@ bool init_renderer() {
                                                       D3D12_RESOURCE_STATE_COMMON, 
                                                       D3D12_RESOURCE_STATE_DEPTH_WRITE);
         cmdlist->ResourceBarrier(1, &t);
+    }
+
+    // Define texture for triangles
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer_Texture;
+    {
+        std::unique_ptr<uint8_t[]> ddsData;
+        std::vector<D3D12_SUBRESOURCE_DATA> subresources;
+        ID3D12Resource* tex_ptr;
+        HRESULT res = DirectX::LoadDDSTextureFromFile(
+            dx12.Device.Get(),
+            L"../Data/metal.dds",
+            &tex_ptr,
+            ddsData,
+            subresources);
+
+        if FAILED(res) {
+            RH_FATAL("Could not load .dds texture!");
+            return false;
+        }
+
+        dx12.Texture.Attach(tex_ptr);
+
+        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex_ptr, 0, static_cast<UINT>(subresources.size()));
+
+        // create an upload buffer and upload to the default heap
+        {
+            auto prop = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            auto desc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
+            dx12.Device->CreateCommittedResource(
+                &prop, D3D12_HEAP_FLAG_NONE,
+                &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&upload_buffer_Texture));
+        }
+
+        // subresources are already defined
+        // Just need to schedule the copy into the default resource
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.Texture.Get(), 
+                                                                              D3D12_RESOURCE_STATE_COMMON, 
+                                                                              D3D12_RESOURCE_STATE_COPY_DEST);
+        cmdlist->ResourceBarrier(1, &barrier);
+        UpdateSubresources(cmdlist.Get(),                                   // cmdList
+                           dx12.Texture.Get(),                              // Destination
+                           upload_buffer_Texture.Get(),                     // Intermediate
+                           0,                                               // IntermediateOffset
+                           0,                                               // FirstSubresource
+                           static_cast<UINT>(subresources.size()),          // NumSubresources
+                           subresources.data());                            // Subresources
+        barrier = CD3DX12_RESOURCE_BARRIER::Transition(dx12.Texture.Get(),
+                                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmdlist->ResourceBarrier(1, &barrier);
+
+        // create SRV descriptors
+        CD3DX12_CPU_DESCRIPTOR_HANDLE hdesc(dx12.CBVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+                                            0, dx12.CBVDescriptorSize);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+        desc.Format = DXGI_FORMAT_BC3_UNORM;
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        desc.Texture2D.MostDetailedMip = 0;
+        desc.Texture2D.MipLevels = 1;
+        desc.Texture2D.PlaneSlice = 0;
+        desc.Texture2D.ResourceMinLODClamp = 0.0;
+
+        dx12.Device->CreateShaderResourceView(dx12.Texture.Get(), &desc, hdesc);
+
+        // create sampler
+        D3D12_SAMPLER_DESC sdesc = {};
+        sdesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sdesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sdesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sdesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sdesc.MinLOD = 0;
+        sdesc.MaxLOD = D3D12_FLOAT32_MAX;
+        sdesc.MipLODBias = 0.0f;
+        sdesc.MaxAnisotropy = 1;
+        sdesc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+
+        dx12.Device->CreateSampler(&sdesc, dx12.SamDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
     // Define the geometry for a dynamic vertex buffer
@@ -811,7 +952,7 @@ bool init_renderer() {
                                      shader_defines,
                                      NULL,
                                      "VS",
-                                     "vs_5_0",
+                                     "vs_5_1",
                                      D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
                                      0,
                                      &vs_bytecode,
@@ -829,7 +970,7 @@ bool init_renderer() {
                                      shader_defines,
                                      NULL,
                                      "PS",
-                                     "ps_5_0",
+                                     "ps_5_1",
                                      D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
                                      0,
                                      &ps_bytecode,
@@ -861,7 +1002,7 @@ bool init_renderer() {
         desc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
 
         desc.InputLayout.pInputElementDescs = vert_desc;
-        desc.InputLayout.NumElements = 2;
+        desc.InputLayout.NumElements = 3;
 
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 
@@ -1095,20 +1236,31 @@ bool renderer_draw_frame() {
             dx12.CommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
         }
 
+        ID3D12DescriptorHeap* descriptorHeaps[] = {
+            dx12.CBVDescriptorHeap.Get(),
+            dx12.SamDescriptorHeap.Get(),
+        };
+        dx12.CommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
         dx12.CommandList->SetGraphicsRootSignature(dx12.RootSignature.Get());
-        //ID3D12DescriptorHeap* descriptorHeaps[] = {
-        //    dx12.CBVDescriptorHeap.Get()
-        //};
-        //dx12.CommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
-        //CD3DX12_GPU_DESCRIPTOR_HANDLE cbv(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-        //cbv.Offset(0, dx12.CBVDescriptorSize);
-
+        dx12.CommandList->SetGraphicsRoot32BitConstant(0, 0, 0);
         dx12.CommandList->SetGraphicsRootConstantBufferView(1, dx12.frames[dx12.frame_idx].upload_cbuffer_PerFrame->GetGPUVirtualAddress());
         dx12.CommandList->SetGraphicsRootConstantBufferView(2, dx12.frames[dx12.frame_idx].upload_cbuffer_PerModel->GetGPUVirtualAddress());
 
+        CD3DX12_GPU_DESCRIPTOR_HANDLE tex(dx12.CBVDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+        tex.Offset(0, dx12.CBVDescriptorSize);
+        dx12.CommandList->SetGraphicsRootDescriptorTable(3, tex);
+
+        CD3DX12_GPU_DESCRIPTOR_HANDLE sam(dx12.SamDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+        //sam.Offset(0, dx12.CBVDescriptorSize);
+        dx12.CommandList->SetGraphicsRootDescriptorTable(4, sam);
+
         dx12.CommandList->IASetVertexBuffers(0, 1, &dx12.TriangleVBView);
         dx12.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        // Bind as shader input to root parameter.
+        //CD3DX12_GPU_DESCRIPTOR_HANDLE tex = …;
+        //dx12.CommandList->SetGraphicsRootDescriptorTable(rootParamIndex, tex);
 
         // bind and draw the vertex buffer
         dx12.CommandList->SetGraphicsRoot32BitConstant(0, 0, 0);
