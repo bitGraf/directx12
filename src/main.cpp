@@ -47,7 +47,7 @@ int WinMain() {
     config.start_x = 20;
     config.start_y = 20;
     config.start_width = 800;
-    config.start_height = 600;
+    config.start_height = 800;
     config.requested_memory = 1024*1024;
     if (!platform_startup(&config)) {
         RH_FATAL("Failed on platform startup!");
