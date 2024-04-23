@@ -1,3 +1,108 @@
+#if 0
+#include <stdio.h>
+
+#include "Memory/Memory_Arena.h"
+#include "Memory/Memory.h"
+#include "Core/Asserts.h"
+#include "Core/Logger.h"
+
+typedef uint16 Texture_Handle;
+
+struct Renderer_Texture {
+    uint64 gpu_handle;
+    uint16 width, height;
+    uint16 format;
+
+    char*    name;
+    wchar_t* filename;
+    uint8*   data;
+};
+
+struct Texture_Storage {
+    uint16 num_entries;
+    uint16 capacity;
+
+    memory_arena* arena;
+    Renderer_Texture* textures; // dynarray
+};
+
+Texture_Handle Create_New_Texture(Texture_Storage* ts);
+void Init_Texture_Storage(Texture_Storage* ts, memory_arena* arena, uint16 max_capacity = 1024) {
+    *ts = {};
+    ts->num_entries = 0;
+    ts->capacity = max_capacity;
+    ts->arena = arena;
+    ts->textures = CreateArray(arena, Renderer_Texture, max_capacity);
+
+    Texture_Handle nil = Create_New_Texture(ts); // reserve handle 0 as a NULL handle.
+
+    printf("Texture Storage created with %u slots\n", max_capacity);
+}
+
+Texture_Handle Create_New_Texture(Texture_Storage* ts) {
+    AssertMsg(ts->num_entries < ts->capacity, "Texture_Storage ran out of room to create new texture handles!");
+
+    Texture_Handle new_handle = ts->num_entries;
+    ts->num_entries++;
+    ArrayAdd(ts->textures);
+
+    Renderer_Texture* new_texture = ArrayPeek(ts->textures);
+    memory_set(new_texture, 0, sizeof(*new_texture));
+
+    printf("New Texture Handle created: %u\n", new_handle);
+
+    return new_handle;
+}
+
+bool Load_Texture_From_File(Texture_Storage* ts, Texture_Handle handle, wchar_t* filename) {
+    printf("Loading '%ws' into texture %u\n", filename, handle);
+
+    ts->textures[handle].gpu_handle = 1;
+    ts->textures[handle].width  = 1024;
+    ts->textures[handle].height = 1024;
+    ts->textures[handle].format = 1;
+    ts->textures[handle].name = "texture_name";
+    ts->textures[handle].filename = filename;
+
+    return true;
+}
+
+Renderer_Texture* Get_Texture_Data(Texture_Storage* ts, Texture_Handle handle) {
+    AssertMsg(handle > 0 && handle < ts->capacity, "Invalid Handle");
+
+    return &ts->textures[handle];
+};
+
+void print_texture_data(Renderer_Texture* tex) {
+    printf("------------------------------------------\n");
+    printf(" Texture Info: '%s'\n", tex->name);
+    printf(" Filename:     '%ws'\n", tex->filename);
+    printf(" Resolution:    %u x %u\n", tex->width, tex->height);
+    printf("\n");
+}
+
+int main(int argc, char* argv[]) {
+    uint64 arena_size = 1024 * 1024;
+    uint8* memory = (uint8*)malloc(arena_size);
+    memory_arena arena;
+    CreateArena(&arena, arena_size, memory);
+
+    Texture_Storage storage;
+    Init_Texture_Storage(&storage, &arena);
+
+    Texture_Handle h1 = Create_New_Texture(&storage);
+    Renderer_Texture* tex = Get_Texture_Data(&storage, h1);
+    print_texture_data(tex);
+
+    Load_Texture_From_File(&storage, h1, L"metal.dds");
+    print_texture_data(tex);
+
+    free(memory);
+
+    return 0;
+}
+
+#else
 #include <stdio.h>
 
 #include "Memory/Memory_Arena.h"
@@ -38,7 +143,6 @@ bool32 engine_on_resize(uint16 code, void* sender, void* listener, event_context
 
 //int main() {
 int WinMain() {
-    printf("Hello, World!\n");
     InitLogging(true, log_level::LOG_LEVEL_TRACE);
     platform_setup_paths();
 
@@ -253,3 +357,4 @@ bool32 engine_on_resize(uint16 code, void* sender, void* listener, event_context
 
     return false;
 }
+#endif

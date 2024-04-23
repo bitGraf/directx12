@@ -66,6 +66,7 @@ struct target_config {
     std::vector<std::string> link_libs;
     std::string link_dir = "";
     std::string subsystem = "console";
+    std::string entry_point = "";
     bool ignore_standard_include_paths = false;
 };
 
@@ -113,6 +114,10 @@ std::string generate_target_build_cmd(const project_config& conf, const target_c
 
     for (auto l : targ.link_libs) {
         link_flags += l + " ";
+    }
+
+    if (targ.entry_point != "") {
+        link_flags += "/ENTRY:" + targ.entry_point + " ";
     }
 
     // assemble full command

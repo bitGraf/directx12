@@ -1322,6 +1322,7 @@ namespace
         DDS_LOADER_FLAGS loadFlags,
         _Outptr_ ID3D12Resource** texture,
         std::vector<D3D12_SUBRESOURCE_DATA>& subresources,
+        DXGI_FORMAT* outFormat,
         _Out_opt_ bool* outIsCubeMap) noexcept(false)
     {
         HRESULT hr = S_OK;
@@ -1601,6 +1602,8 @@ namespace
             subresources.clear();
         }
 
+        if (outFormat) *outFormat = format;
+
         return hr;
     }
 
@@ -1736,7 +1739,7 @@ HRESULT DirectX::LoadDDSTextureFromMemoryEx(
     hr = CreateTextureFromDDS(d3dDevice,
         header, bitData, bitSize, maxsize,
         resFlags, loadFlags,
-        texture, subresources, isCubeMap);
+        texture, subresources, NULL, isCubeMap);
     if (SUCCEEDED(hr))
     {
         SetDebugObjectName(*texture, L"DDSTextureLoader");
@@ -1757,6 +1760,7 @@ HRESULT DirectX::LoadDDSTextureFromFile(
     ID3D12Resource** texture,
     std::unique_ptr<uint8_t[]>& ddsData,
     std::vector<D3D12_SUBRESOURCE_DATA>& subresources,
+    DXGI_FORMAT* format,
     size_t maxsize,
     DDS_ALPHA_MODE* alphaMode,
     bool* isCubeMap)
@@ -1770,6 +1774,7 @@ HRESULT DirectX::LoadDDSTextureFromFile(
         texture,
         ddsData,
         subresources,
+        format,
         alphaMode,
         isCubeMap);
 }
@@ -1784,6 +1789,7 @@ HRESULT DirectX::LoadDDSTextureFromFileEx(
     ID3D12Resource** texture,
     std::unique_ptr<uint8_t[]>& ddsData,
     std::vector<D3D12_SUBRESOURCE_DATA>& subresources,
+    DXGI_FORMAT* format,
     DDS_ALPHA_MODE* alphaMode,
     bool* isCubeMap)
 {
@@ -1823,7 +1829,7 @@ HRESULT DirectX::LoadDDSTextureFromFileEx(
     hr = CreateTextureFromDDS(d3dDevice,
         header, bitData, bitSize, maxsize,
         resFlags, loadFlags,
-        texture, subresources, isCubeMap);
+        texture, subresources, format, isCubeMap);
 
     if (SUCCEEDED(hr))
     {

@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     targ.warnings_are_errors = true;
     targ.subsystem = "windows";
     targ.ignore_standard_include_paths = false;
+    //targ.entry_point = "test_textures";
     conf.targets.push_back(targ);
 
     LARGE_INTEGER freq, start, end;
